@@ -1,1 +1,0 @@
-# Pharam_intellienge
