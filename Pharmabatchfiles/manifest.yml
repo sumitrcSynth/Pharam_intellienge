@@ -1,0 +1,30 @@
+# PharmaCopilot Native App — manifest.yml
+# Co-authored with CoCo
+manifest_version: 2
+
+artifacts:
+  setup_script: setup.sql
+  readme: docs/README.md
+  default_streamlit: GOLD_V2.PHARMA_UI
+  extension_code: true
+
+configuration:
+  log_level: INFO
+  trace_level: OFF
+
+privileges:
+  - EXECUTE TASK:
+      description: >
+        Allows the application to execute Snowflake Tasks for automated
+        pipeline scheduling (Silver, Feature Engineering, Gold refresh).
+
+references:
+  - CONSUMER_WAREHOUSE:
+      label: "Pipeline Execution Warehouse"
+      description: >
+        Warehouse used to execute the PharmaCopilot data pipeline and ML UDF.
+      privileges:
+        - USAGE
+      object_type: WAREHOUSE
+      multi_valued: false
+      register_callback: APP_CONFIG.REGISTER_REFERENCE

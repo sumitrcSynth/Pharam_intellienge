@@ -1,0 +1,4499 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# PharmaCopilot Streamlit app with ML UDF reference updated to ML_CODE versioned schema
+# Co-authored with CoCo
+# PHARMA COPILOT — Streamlit App (Refactored)
+# Architecture: ML UDF → Gold Layer → UI
+# Data flow:    Gold layer drives all display. ML UDF used only for prediction.
+#               Simulation: features → ML UDF → probability → Gold decision logic
+#               → financial recalculation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import streamlit as st
+import math
+import importlib
+import io
+import logging
+from pathlib import Path
+import pandas as pd
+try:
+    from snowflake.snowpark.context import get_active_session
+except Exception:
+    def get_active_session():
+        raise RuntimeError("snowflake-snowpark-python is not installed or no Snowflake session is active")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    st.set_page_config(
+        page_title="PharmaCopilot",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+except Exception:
+    pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+GOLD_SCHEMA     = "GOLD_V2"
+FEATURE_SCHEMA  = "FEATURE_TEST"
+UDF_FQN         = "ML_CODE.PREDICT_BATCH_FAILURE_PROB"
+CORTEX_MODEL    = "mistral-large2"
+SEMANTIC_MODEL  = "@GOLD_V2.PHARMA_UI_STAGE/pharma_semantic_model.yaml"
+BASE_DIR        = Path(__file__).parent
+logger          = logging.getLogger(__name__)
+
+# Decision thresholds (match Gold layer)
+THRESH_RELEASE = 0.20
+THRESH_RETEST  = 0.40
+THRESH_HOLD    = 0.65
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_session():
+    try:
+        return get_active_session()
+    except Exception as exc:
+        logger.warning("No active Snowflake session is available: %s", exc)
+        return None
+
+
+session = get_session()
+
+
+def load_static_image_bytes(filename: str) -> bytes | None:
+    """Resolve static assets from local bundle first, then Native App stages."""
+    candidate_names = list(dict.fromkeys([filename, filename.lower(), filename.upper()]))
+    local_dirs = [
+        BASE_DIR,
+        BASE_DIR / "artifacts",
+        BASE_DIR / "docs",
+        BASE_DIR / "assets",
+        BASE_DIR.parent,
+        BASE_DIR.parent / "artifacts",
+        BASE_DIR.parent / "docs",
+        BASE_DIR.parent / "assets",
+        BASE_DIR.parent.parent,
+        BASE_DIR.parent.parent / "artifacts",
+        BASE_DIR.parent.parent / "docs",
+        BASE_DIR.parent.parent / "assets",
+    ]
+    local_paths = [
+        local_dir / candidate_name
+        for local_dir in local_dirs
+        for candidate_name in candidate_names
+    ]
+    for image_path in local_paths:
+        try:
+            if image_path.exists():
+                return image_path.read_bytes()
+        except Exception as exc:
+            logger.warning("Unable to read local image path %s: %s", image_path, exc)
+
+    stage_paths = [
+        f'@"{GOLD_SCHEMA}"."PHARMA_UI_STAGE"/{filename}',
+        f'@{GOLD_SCHEMA}.PHARMA_UI_STAGE/{filename}',
+    ]
+    if session is not None:
+        for stage_path in stage_paths:
+            try:
+                return session.file.get_stream(stage_path).read()
+            except Exception as exc:
+                logger.warning("Unable to read staged image path %s: %s", stage_path, exc)
+
+    logger.warning("Static image %s was not found in local bundle or configured stages.", filename)
+    return None
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION STATE INIT
+# ─────────────────────────────────────────────────────────────────────────────
+_defaults = {
+    "page":           "landing",
+    "sim_batch_id":   None,
+    "filter_opt":     "All",
+    "ml_pred":        None,
+    "last_ml_batch":  None,
+    "simulated_data": None,
+    "reset_counter":  0,
+}
+for k, v in _defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA LOADERS  (all read from Gold layer)
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
+def load_kpi() -> "pd.DataFrame":
+    return session.sql(f"SELECT * FROM {GOLD_SCHEMA}.VW_UI_KPI").to_pandas()
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_batch_list() -> "pd.DataFrame":
+    return session.sql(f"""
+        SELECT
+        BATCH_ID,
+        PRODUCT_NAME,
+        PRODUCT_TYPE,
+        PLANT_ID,
+        DOSAGE_FORM,
+        BATCH_DATE,
+    
+        FAILURE_PROBABILITY,
+        FINAL_DECISION,
+    
+        TOP_RISK_FACTOR_1,
+        TOTAL_COMMITTED_REVENUE
+        FROM {GOLD_SCHEMA}.VW_UI_BATCH_LIST
+    """).to_pandas()
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_batch_detail(batch_id: str | None) -> "pd.DataFrame":
+    """Load full batch detail from Gold BATCH_FACT (single source of truth)."""
+    if not batch_id:
+        return pd.DataFrame()
+
+    safe_id = str(batch_id).replace("'", "''")
+    return session.sql(f"""
+        SELECT * FROM {GOLD_SCHEMA}.BATCH_FACT
+        WHERE BATCH_ID = '{safe_id}'
+    """).to_pandas()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_simulation_base(batch_id: str | None) -> "pd.DataFrame":
+    """Load simulation base view with mutable features and fixed context."""
+    if not batch_id:
+        return pd.DataFrame()
+
+    safe_id = str(batch_id).replace("'", "''")
+    return session.sql(f"""
+        SELECT * FROM {GOLD_SCHEMA}.VW_UI_SIMULATION_BASE
+        WHERE BATCH_ID = '{safe_id}'
+    """).to_pandas()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DECISION & FINANCIAL LOGIC  (mirrors Gold layer — single source of truth)
+# ─────────────────────────────────────────────────────────────────────────────
+def derive_decision_from_prob(
+    failure_prob: float,
+    sterility_flag: int,
+    endotoxin_flag: int,
+    has_auto_block: int,
+    fda_critical_violations: int,
+    max_hold_days: int
+) -> tuple[str, str | None]:
+    """
+    Apply Gold-layer decision logic:
+      1. Sterility + Endotoxin  → hard REJECT
+      2. FDA auto-block rule    → REJECT
+      3. FDA critical ≥ 3       → REJECT
+      4. Hold days + ML=RELEASE → downgrade to HOLD
+      5. Else trust ML thresholds
+    Returns (final_decision, rule_override_reason)
+    """
+    # ML-derived action from probability
+    if failure_prob <= THRESH_RELEASE:
+        ml_action = "RELEASE"
+    elif failure_prob <= THRESH_RETEST:
+        ml_action = "RETEST"
+    elif failure_prob <= THRESH_HOLD:
+        ml_action = "HOLD"
+    else:
+        ml_action = "REJECT"
+
+    # Rule overrides (priority order)
+    if sterility_flag == 1 and endotoxin_flag == 1:
+        return "REJECT", "STERILITY_HARD_RULE"
+    if has_auto_block == 1:
+        return "REJECT", "FDA_AUTO_BLOCK"
+    if fda_critical_violations >= 3:
+        return "REJECT", "CRITICAL_VIOLATIONS"
+    if max_hold_days > 0 and ml_action == "RELEASE":
+        return "HOLD", "HOLD_DAYS_APPLIED"
+
+    return ml_action, None
+
+
+def recalculate_financials(
+    decision: str,
+    total_committed_revenue: float,
+    total_material_cost: float,
+    total_penalty_exposure: float,
+    total_estimated_penalty_usd: float
+) -> dict:
+    """
+    Recalculate financial outcomes based on decision.
+    Mirrors Gold layer FINAL_REVENUE / FINAL_PROFIT / PENALTY_APPLIED logic.
+    """
+    rev  = total_committed_revenue  or 0
+    mat  = total_material_cost      or 0
+    pen  = total_penalty_exposure   or 0
+    fpen = total_estimated_penalty_usd or 0
+
+    if decision == "RELEASE":
+        final_revenue  = round(rev - pen * 0.1, 2)
+        final_profit   = round(final_revenue - mat, 2)
+        penalty_applied = 0.0
+
+    elif decision == "RETEST":
+        final_revenue  = round(rev * 0.90 - pen * 0.3, 2)
+        final_profit   = round(final_revenue - mat, 2)
+        penalty_applied = round(pen * 0.3, 2)
+
+    elif decision == "HOLD":
+        final_revenue  = round(-mat * 0.05, 2)
+        final_profit   = round(-pen - mat, 2)
+        penalty_applied = round(pen * 0.3, 2)
+
+    else:  # REJECT
+        final_revenue  = round(-(pen + mat), 2)
+        final_profit   = round(-(pen + fpen + mat), 2)
+        penalty_applied = round(pen + fpen, 2)
+
+    return {
+        "final_revenue":   final_revenue,
+        "final_profit":    final_profit,
+        "penalty_applied": penalty_applied,
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ML UDF CALLER  (pure feature prediction — no financials)
+# ─────────────────────────────────────────────────────────────────────────────
+def call_ml_udf(params: dict) -> float | None:
+    """
+    Call the XGBoost UDF with ONLY batch quality/process features.
+    Returns raw failure probability (0-1).
+    The UDF signature (from gold_v2 ML_PREDICTIONS) uses 39 feature params.
+    """
+    try:
+        sql = f"""
+        SELECT {UDF_FQN}(
+            -- Product identity
+            '{params["product_type"]}'::VARCHAR,
+            '{params["plant_id"]}'::VARCHAR,
+            'QA_REVIEW'::VARCHAR,
+            '{params["batch_size_bucket"]}'::VARCHAR,
+            '{params["duration_bucket"]}'::VARCHAR,
+            -- Lab
+            {params["total_tests"]}::NUMBER,
+            {params["failed_tests"]}::NUMBER,
+            {params["oos_count"]}::NUMBER,
+            {params["borderline_count"]}::NUMBER,
+            {params["pass_rate_pct"]}::FLOAT,
+            {params["oos_rate_pct"]}::FLOAT,
+            {params["fail_rate_pct"]}::FLOAT,
+            {params["sterility_fail_flag"]}::NUMBER,
+            {params["endotoxin_fail_flag"]}::NUMBER,
+            {params["sterility_x_endotoxin"]}::NUMBER,
+            -- Sensor / IoT
+            {params["temp_violation_count"]}::NUMBER,
+            {params["temp_max_excursion_mins"]}::FLOAT,
+            {params["avg_temp_deviation_c"]}::FLOAT,
+            {params["humidity_violation_count"]}::NUMBER,
+            {params["pressure_violation_count"]}::NUMBER,
+            {params["total_iot_violations"]}::NUMBER,
+            {params["iot_violation_density"]}::FLOAT,
+            {params["temp_x_duration"]}::FLOAT,
+            -- Deviations
+            {params["total_deviations"]}::NUMBER,
+            {params["critical_deviation_count"]}::NUMBER,
+            {params["high_deviation_count"]}::NUMBER,
+            {params["weighted_deviation_score"]}::FLOAT,
+            {params["process_deviation_count"]}::NUMBER,
+            {params["equipment_deviation_count"]}::NUMBER,
+            {params["human_deviation_count"]}::NUMBER,
+            {params["deviation_density"]}::FLOAT,
+            {params["critical_dev_rate"]}::FLOAT,
+            {params["temp_x_critical_dev"]}::NUMBER,
+            -- Process
+            {params["batch_size"]}::FLOAT,
+            {params["batch_duration_hours"]}::FLOAT,
+            {params["process_variance"]}::FLOAT,
+            -- Temporal
+            {params["batch_start_hour"]}::NUMBER,
+            {params["batch_start_dow"]}::NUMBER,
+            {params["is_weekend_batch"]}::NUMBER,
+            {params["is_night_shift"]}::NUMBER
+        ) AS PREDICTION
+        """
+        df = session.sql(sql).to_pandas()
+        if not df.empty:
+            return float(df["PREDICTION"].iloc[0])
+    except Exception as e:
+        st.error(f"ML UDF error: {e}")
+    return None
+
+
+def build_udf_params_from_simulation(orig: dict, sim_inputs: dict) -> dict:
+    """
+    Merge fixed (orig) and simulated (sim_inputs) into the UDF parameter dict.
+    Derives all computed features from simulated mutable values.
+    """
+    # Simulated mutable values
+    temp_v  = int(sim_inputs["temp_viol"])
+    hum_v   = int(sim_inputs["hum_viol"])
+    pres_v  = int(sim_inputs["pres_viol"])
+    fail_t  = int(sim_inputs["failed_tests"])
+    oos     = int(sim_inputs["oos"])
+    border  = int(sim_inputs["borderline"])
+    pass_rt = float(sim_inputs["pass_rate"])
+    crit_d  = int(sim_inputs["crit_dev"])
+    high_d  = int(sim_inputs["high_dev"])
+    proc_v  = float(sim_inputs["proc_var"])
+
+    total_tests  = int(orig.get("total_tests", 20))
+    batch_size   = float(orig.get("batch_size", 5000))
+    batch_dur    = float(orig.get("batch_duration_hours", 24))
+
+    # Derived features (mirrors feature engineering logic)
+    total_iot    = temp_v + hum_v + pres_v
+    total_dev    = crit_d + high_d
+    oos_rate     = round(oos / max(total_tests, 1) * 100, 4)
+    fail_rate    = round(fail_t / max(total_tests, 1) * 100, 4)
+    iot_density  = round(total_iot / max(batch_dur, 1), 4)
+    temp_x_dur   = round(temp_v * batch_dur, 4)
+    wt_dev_score = float(crit_d * 4 + high_d * 3)
+    dev_density  = round(total_dev / max(batch_size, 1), 6)
+    crit_rate    = round(crit_d / max(total_dev, 1), 4)
+    temp_x_crit  = temp_v * crit_d
+    temp_exc_min = float(temp_v * 5.0)  # proxy: 5 min per violation
+
+    return {
+        # Fixed product identity
+        "product_type":           str(orig.get("product_type", "SOLID")),
+        "plant_id":               str(orig.get("plant_id", "PLANT_01")),
+        "batch_size_bucket":      (
+            "SMALL"  if batch_size < 100  else
+            "MEDIUM" if batch_size < 500  else "LARGE"
+        ),
+        "duration_bucket":        (
+            "SHORT"  if batch_dur < 12 else
+            "NORMAL" if batch_dur < 36 else "LONG"
+        ),
+        # Lab (mix of fixed + simulated)
+        "total_tests":            total_tests,
+        "failed_tests":           fail_t,
+        "oos_count":              oos,
+        "borderline_count":       border,
+        "pass_rate_pct":          pass_rt,
+        "oos_rate_pct":           oos_rate,
+        "fail_rate_pct":          fail_rate,
+        "sterility_fail_flag":    int(orig.get("sterility_fail_flag", 0)),
+        "endotoxin_fail_flag":    int(orig.get("endotoxin_fail_flag", 0)),
+        "sterility_x_endotoxin":  int(orig.get("sterility_x_endotoxin", 0)),
+        # IoT (simulated)
+        "temp_violation_count":   temp_v,
+        "temp_max_excursion_mins": temp_exc_min,
+        "avg_temp_deviation_c":   float(orig.get("avg_temp_deviation_c", 0)),
+        "humidity_violation_count": hum_v,
+        "pressure_violation_count": pres_v,
+        "total_iot_violations":   total_iot,
+        "iot_violation_density":  iot_density,
+        "temp_x_duration":        temp_x_dur,
+        # Deviations (simulated)
+        "total_deviations":       total_dev,
+        "critical_deviation_count": crit_d,
+        "high_deviation_count":   high_d,
+        "weighted_deviation_score": wt_dev_score,
+        "process_deviation_count":  int(orig.get("process_deviation_count", 0)),
+        "equipment_deviation_count": int(orig.get("equipment_deviation_count", 0)),
+        "human_deviation_count":  int(orig.get("human_deviation_count", 0)),
+        "deviation_density":      dev_density,
+        "critical_dev_rate":      crit_rate,
+        "temp_x_critical_dev":    temp_x_crit,
+        # Process
+        "batch_size":             batch_size,
+        "batch_duration_hours":   batch_dur,
+        "process_variance":       proc_v,
+        # Temporal (fixed)
+        "batch_start_hour":       int(orig.get("batch_start_hour", 8)),
+        "batch_start_dow":        int(orig.get("batch_start_dow", 1)),
+        "is_weekend_batch":       int(orig.get("is_weekend_batch", 0)),
+        "is_night_shift":         int(orig.get("is_night_shift", 0)),
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+def safe(val, fallback="—"):
+    s = str(val) if val is not None else ""
+    return s if s.strip() not in ("", "nan", "None") else fallback
+
+def safe_int(val, default=0):
+    try:
+        if val is None:
+            return default
+
+        if str(val).lower() in ("nan", "none", ""):
+            return default
+
+        return int(float(val))
+
+    except Exception:
+        return default
+
+def pct_int(val):
+    try:
+        v = float(val)
+        return int(v * 100) if v <= 1.0 else int(v)
+    except Exception:
+        return 0
+
+def fmt_currency(val):
+    try:
+        v = float(val or 0)
+        if v >= 1e9:  return f"${v/1e9:.2f}B"
+        if v >= 1e6:  return f"${v/1e6:.1f}M"
+        if v >= 1e3:  return f"${v/1e3:.1f}K"
+        return f"${v:,.0f}"
+    except Exception:
+        return "—"
+
+def badge_html(decision):
+    cls_map = {
+        "RELEASE": "b-release", "REJECT": "b-reject",
+        "HOLD": "b-hold", "RETEST": "b-retest",
+    }
+    cls = cls_map.get(decision, "b-hold")
+    return f'<span class="badge {cls}">{decision}</span>'
+
+def decision_colors(decision):
+    return {
+        "RELEASE": ("#dcfce7", "#15803d", "#bbf7d0"),
+        "REJECT":  ("#fee2e2", "#b91c1c", "#fecaca"),
+        "HOLD":    ("#fef3c7", "#b45309", "#fde68a"),
+        "RETEST":  ("#e0f2fe", "#0369a1", "#bae6fd"),
+    }.get(decision, ("#fef3c7", "#b45309", "#fde68a"))
+
+def risk_label_and_cls(fp_pct):
+    if fp_pct >= 65:   return "HIGH",   "r-high"
+    if fp_pct >= 35:   return "MEDIUM", "r-medium"
+    return "LOW", "r-low"
+
+def risk_colors_map(risk):
+    return {
+        "HIGH":   ("#fee2e2", "#b91c1c"),
+        "MEDIUM": ("#fef3c7", "#b45309"),
+        "LOW":    ("#dcfce7", "#15803d"),
+    }.get(risk, ("#fef3c7", "#b45309"))
+
+def fp_color(fp_pct):
+    if fp_pct >= 65: return "#dc2626"
+    if fp_pct >= 35: return "#d97706"
+    return "#16a34a"
+
+def bar_w(val, mx):
+    try:
+        return min(int(float(val) / max(float(mx), 1) * 100), 100)
+    except Exception:
+        return 0
+
+def donut_svg(segments, size=110):
+    total = sum(s[0] for s in segments) or 1
+    cx = cy = size / 2
+    r = size * 0.38
+    stroke_w = size * 0.18
+    gap = 2
+    paths = []
+    angle = -90
+    for val, color, label in segments:
+        sweep = (val / total) * 360 - gap
+        if sweep <= 0:
+            continue
+        a1 = math.radians(angle)
+        a2 = math.radians(angle + sweep)
+        x1 = cx + r * math.cos(a1)
+        y1 = cy + r * math.sin(a1)
+        x2 = cx + r * math.cos(a2)
+        y2 = cy + r * math.sin(a2)
+        large = 1 if sweep > 180 else 0
+        paths.append(
+            f'<path d="M {round(x1,2)} {round(y1,2)} A {round(r,2)} {round(r,2)} 0 {large} 1 {round(x2,2)} {round(y2,2)}" '
+            f'fill="none" stroke="{color}" stroke-width="{round(stroke_w,2)}" stroke-linecap="butt"/>'
+        )
+        angle += sweep + gap
+    return (
+        f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}" xmlns="http://www.w3.org/2000/svg">'
+        f'<circle cx="{cx}" cy="{cy}" r="{round(r,2)}" fill="none" stroke="#f0ede8" stroke-width="{round(stroke_w,2)}"/>'
+        + "".join(paths) + "</svg>"
+    )
+
+def svg_comparison_bars(params_current, params_simulated, labels):
+    n = len(labels)
+    row_h, lbl_w, bar_area, chart_h, chart_w = 36, 150, 260, n * 36 + 28, 320
+    max_val = max(max(params_current + params_simulated), 1)
+    rows = []
+    for i, (lbl, cur, sim) in enumerate(zip(labels, params_current, params_simulated)):
+        y = 14 + i * row_h
+        cur_w = int((cur / max_val) * (bar_area - 20))
+        sim_w = int((sim / max_val) * (bar_area - 20))
+        cur_lbl = str(int(cur)) if cur == int(cur) else str(round(cur, 2))
+        sim_lbl = str(int(sim)) if sim == int(sim) else str(round(sim, 2))
+        rows.append(
+            f'<text x="{lbl_w-8}" y="{y+9}" text-anchor="end" font-size="10" fill="#6b7280" font-family="IBM Plex Sans,sans-serif">{lbl}</text>'
+            f'<rect x="{lbl_w}" y="{y}" width="{max(cur_w,3)}" height="9" rx="3" fill="#fca5a5"/>'
+            f'<text x="{lbl_w+max(cur_w,3)+5}" y="{y+9}" font-size="9" fill="#dc2626" font-family="IBM Plex Mono,monospace" font-weight="700">{cur_lbl}</text>'
+            f'<rect x="{lbl_w}" y="{y+14}" width="{max(sim_w,3)}" height="9" rx="3" fill="#86efac"/>'
+            f'<text x="{lbl_w+max(sim_w,3)+5}" y="{y+23}" font-size="9" fill="#16a34a" font-family="IBM Plex Mono,monospace" font-weight="700">{sim_lbl}</text>'
+        )
+    legend = (
+        f'<rect x="{lbl_w}" y="{chart_h-8}" width="10" height="8" rx="2" fill="#fca5a5"/>'
+        f'<text x="{lbl_w+15}" y="{chart_h-1}" font-size="9" fill="#6b7280" font-family="IBM Plex Sans,sans-serif">Current</text>'
+        f'<rect x="{lbl_w+72}" y="{chart_h-8}" width="10" height="8" rx="2" fill="#86efac"/>'
+        f'<text x="{lbl_w+87}" y="{chart_h-1}" font-size="9" fill="#6b7280" font-family="IBM Plex Sans,sans-serif">Simulated</text>'
+    )
+    return (
+        f'<svg width="100%" height="{chart_h+16}" viewBox="0 0 {chart_w} {chart_h+16}" '
+        f'preserveAspectRatio="xMinYMin meet" xmlns="http://www.w3.org/2000/svg">'
+        + "".join(rows) + legend + "</svg>"
+    )
+
+def svg_donut_risk(segments, center_label, size=140):
+    total = sum(s[0] for s in segments) or 1
+    cx = cy = size / 2
+    r = size * 0.36
+    stroke_w = size * 0.20
+    gap = 3
+    paths = []
+    angle = -90
+    for val, color, lbl, pct in segments:
+        sweep = (val / total) * 360 - gap
+        if sweep <= 0:
+            continue
+        a1 = math.radians(angle)
+        a2 = math.radians(angle + sweep)
+        x1 = cx + r * math.cos(a1)
+        y1 = cy + r * math.sin(a1)
+        x2 = cx + r * math.cos(a2)
+        y2 = cy + r * math.sin(a2)
+        large = 1 if sweep > 180 else 0
+        paths.append(
+            f'<path d="M {round(x1,2)} {round(y1,2)} A {round(r,2)} {round(r,2)} 0 {large} 1 {round(x2,2)} {round(y2,2)}" '
+            f'fill="none" stroke="{color}" stroke-width="{round(stroke_w,2)}" stroke-linecap="butt"/>'
+        )
+        angle += sweep + gap
+    svg = (
+        f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}" xmlns="http://www.w3.org/2000/svg">'
+        f'<circle cx="{cx}" cy="{cy}" r="{round(r,2)}" fill="none" stroke="#f1f5f9" stroke-width="{round(stroke_w,2)}"/>'
+        + "".join(paths)
+        + f'<text x="{cx}" y="{cy+6}" text-anchor="middle" font-size="17" font-weight="700" fill="#0f172a" font-family="IBM Plex Mono,monospace">{center_label}</text>'
+        + f'<text x="{cx}" y="{cy+19}" text-anchor="middle" font-size="9" fill="#94a3b8" font-family="IBM Plex Sans,sans-serif">Risk Score</text>'
+        + "</svg>"
+    )
+    legend_html = "".join([
+        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:7px;">'
+        f'<div style="width:10px;height:10px;border-radius:3px;background:{color};flex-shrink:0;"></div>'
+        f'<span style="font-size:10px;color:#64748b;flex:1;">{lbl}</span>'
+        f'<span style="font-size:10px;font-weight:700;color:#0f172a;font-family:IBM Plex Mono,monospace;">{pct}</span></div>'
+        for _, color, lbl, pct in segments
+    ])
+    return svg, legend_html
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FINANCIAL STRIP HTML (reads from Gold layer columns)
+# ─────────────────────────────────────────────────────────────────────────────
+def fin_strip_html(d: dict, override_financials: dict | None = None):
+    """
+    Render financial metrics strip.
+    If override_financials is provided (simulation), use those values.
+    Otherwise, use Gold layer columns directly.
+    """
+    if override_financials:
+        rev_val     = fmt_currency(override_financials.get("final_revenue", 0))
+        profit_val  = fmt_currency(override_financials.get("final_profit", 0))
+        penalty_val = fmt_currency(override_financials.get("penalty_applied", 0))
+        mat_val     = fmt_currency(d.get("TOTAL_MATERIAL_COST", 0))
+        risk_val    = fmt_currency(d.get("OVERALL_RISK_SCORE", 0))
+        penalty_raw = float(override_financials.get("penalty_applied", 0))
+    else:
+        rev_val     = fmt_currency(d.get("TOTAL_COMMITTED_REVENUE", 0))
+        profit_val  = fmt_currency(d.get("FINAL_PROFIT", 0))
+        penalty_val = fmt_currency(d.get("PENALTY_APPLIED", 0))
+        mat_val     = fmt_currency(d.get("TOTAL_MATERIAL_COST", 0))
+        risk_val    = f"{round(float(d.get('OVERALL_RISK_SCORE', 0) or 0) * 100, 1)}%"
+        penalty_raw = float(d.get("PENALTY_APPLIED", 0) or 0)
+
+    profit_raw  = float((override_financials or {}).get("final_profit", d.get("FINAL_PROFIT", 0)) or 0)
+    penalty_clr = "#dc2626" if penalty_raw > 0 else "#16a34a"
+    profit_clr  = "#16a34a" if profit_raw > 0 else "#dc2626"
+
+    metrics = [
+        ("💰", "Revenue",        rev_val,    "#0f172a"),
+        ("📊", "Material Cost",  mat_val,    "#0f172a"),
+        ("⚠️", "Penalty",       penalty_val, penalty_clr),
+        ("📈", "Final Profit",  profit_val,  profit_clr),
+        ("🔧", "Overall Risk",  risk_val,    "#d97706"),
+    ]
+    cards = "".join([
+        f'<div style="flex:1;background:#f8fafc;border:1px solid #f1f5f9;border-radius:8px;'
+        f'padding:8px 10px;text-align:center;min-width:0;">'
+        f'<div style="font-size:13px;margin-bottom:3px;">{icon}</div>'
+        f'<div style="font-family:IBM Plex Mono,monospace;font-size:13px;font-weight:700;color:{color};line-height:1.1;">{val}</div>'
+        f'<div style="font-size:8px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.3px;margin-top:3px;">{lbl}</div>'
+        f'</div>'
+        for icon, lbl, val, color in metrics
+    ])
+    return (
+        '<div style="margin:10px 0 6px 0;">'
+        '<div style="font-size:9px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">💹 Financial Impact</div>'
+        f'<div style="display:flex;gap:6px;">{cards}</div>'
+        '</div>'
+    )
+
+# ═══════════════════════════════════════════════════════════════
+#  ENTERPRISE CHATBOT — PHARMA COPILOT
+#  Paste after SHARED_CSS, before show_dashboard()
+# ═══════════════════════════════════════════════════════════════
+
+# from snowflake.cortex import Complete as CortexComplete
+
+CHATBOT_CSS = """
+<style>
+/* ── Floating trigger button ─────────────────────────── */
+.chat-fab {
+    position: fixed;
+    bottom: 28px;
+    right: 28px;
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+    border: none;
+    cursor: pointer;
+    box-shadow: 0 4px 20px rgba(59,130,246,0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+    z-index: 9999;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.chat-fab:hover {
+    transform: scale(1.08) translateY(-2px);
+    box-shadow: 0 8px 28px rgba(59,130,246,0.55);
+}
+.chat-fab-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    width: 18px;
+    height: 18px;
+    background: #22c55e;
+    border-radius: 50%;
+    border: 2px solid #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    color: #fff;
+    font-weight: 700;
+}
+
+/* ── Chat popup window ───────────────────────────────── */
+.chat-popup {
+    position: fixed;
+    bottom: 96px;
+    right: 28px;
+    width: 400px;
+    height: 560px;
+    background: #ffffff;
+    border-radius: 16px;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.18), 0 4px 20px rgba(0,0,0,0.08);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    z-index: 9998;
+    animation: chatSlideUp 0.25s ease;
+}
+@keyframes chatSlideUp {
+    from { opacity: 0; transform: translateY(20px) scale(0.97); }
+    to   { opacity: 1; transform: translateY(0)   scale(1); }
+}
+
+/* ── Chat header ─────────────────────────────────────── */
+.chat-header {
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    padding: 14px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+}
+.chat-header-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.chat-avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    flex-shrink: 0;
+}
+.chat-header-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #f8fafc;
+    line-height: 1.2;
+}
+.chat-header-sub {
+    font-size: 10px;
+    color: #64748b;
+    margin-top: 2px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+.chat-online-dot {
+    width: 6px;
+    height: 6px;
+    background: #22c55e;
+    border-radius: 50%;
+    display: inline-block;
+    box-shadow: 0 0 5px rgba(34,197,94,0.6);
+}
+.chat-close-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #94a3b8;
+    font-size: 14px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+}
+.chat-close-btn:hover {
+    background: rgba(255,255,255,0.15);
+    color: #f8fafc;
+}
+.hero-grid-row{
+    display:flex;
+    justify-content:space-between;
+    align-items:flex-start;
+    margin-top:18px;
+    gap:20px;
+}
+
+.hero-grid-left{
+    flex:1;
+}
+
+.hero-grid-right{
+    width:170px;
+    text-align:center;
+    flex-shrink:0;
+}
+
+.hero-info-inline{
+    display:flex;
+    gap:22px;
+    flex-wrap:wrap;
+    align-items:center;
+
+    font-size:12px;
+    color:#64748b;
+    font-weight:600;
+}
+
+.hero-risk-inline{
+    margin-top:14px;
+
+    font-size:13px;
+    font-weight:700;
+
+    color:#b45309;
+}
+
+.hero-revenue-inline{
+    margin-top:12px;
+
+    font-size:13px;
+    color:#64748b;
+}
+
+.hero-money{
+    font-weight:700;
+    color:#0f172a;
+
+    font-family:'IBM Plex Mono', monospace;
+}
+.hero-mini-cards{
+    display:flex;
+    gap:12px;
+    flex-wrap:nowrap;
+
+    margin-top:16px;
+
+    width:100%;
+}
+.hero-mini-card.card-plant { border-top: 2px solid #7f77dd; }
+.hero-mini-card.card-type  { border-top: 2px solid #1d9e75; }
+.hero-mini-card.card-date  { border-top: 2px solid #378add; }
+.hero-mini-card.card-rev {
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+    border-top: 2px solid #ef9f27;
+}
+.hero-mini-card.card-rev .hero-mini-label { color: #92400e; }
+
+
+.hero-mini-card{
+    background:#f8fafc;
+
+    border:1px solid #e2e8f0;
+    border-radius:10px;
+
+    padding:10px 14px;
+
+    min-width:105px;
+    max-width:135px;
+
+    flex:1;
+
+    text-align:left;
+
+    box-shadow:
+        0 1px 2px rgba(15,23,42,0.04);
+
+    transition:all 0.18s ease;
+}
+
+
+.hero-mini-card:hover{
+    transform:translateY(-1px);
+
+    box-shadow:
+        0 6px 14px rgba(15,23,42,0.06);
+}
+.hero-mini-top{
+    display:flex;
+    align-items:center;
+    gap:8px;
+
+    margin-bottom:10px;
+}
+.hero-mini-icon{
+    font-size:18px;
+}
+.hero-mini-label{
+    font-size:11px;
+
+    font-weight:700;
+
+    letter-spacing:0.5px;
+
+    color:#94a3b8;
+
+    text-transform:uppercase;
+}
+
+.hero-mini-value{
+    font-size:15px;
+
+    font-weight:700;
+
+    color:#0f172a;
+
+    line-height:1.2;
+}
+
+.card-plant .hero-mini-icon{ color:#7c3aed; }
+.card-type .hero-mini-icon{ color:#059669; }
+.card-date .hero-mini-icon{ color:#2563eb; }
+.card-rev{
+    background:#fffaf0;
+    border-color:#fcd34d;
+}
+.hero-risk-pill{
+    margin-top:14px;
+
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+
+    background:#fff7ed;
+
+    border:1px solid #fed7aa;
+
+    color:#b45309;
+
+    border-radius:999px;
+
+    padding:7px 12px;
+
+    font-size:12px;
+
+    font-weight:600;
+}
+
+/* ── Context pill (batch awareness) ─────────────────── */
+.chat-context-pill {
+    background: #fffbeb;
+    border-bottom: 1px solid #fde68a;
+    padding: 7px 14px;
+    font-size: 10px;
+    color: #78350f;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+/* ── Messages area ───────────────────────────────────── */
+.chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    background: #f8fafc;
+}
+.chat-messages::-webkit-scrollbar { width: 3px; }
+.chat-messages::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 4px; }
+
+/* ── Message bubbles ─────────────────────────────────── */
+.chat-msg {
+    display: flex;
+    flex-direction: column;
+    max-width: 88%;
+}
+.chat-msg-user {
+    align-self: flex-end;
+    align-items: flex-end;
+}
+.chat-msg-bot {
+    align-self: flex-start;
+    align-items: flex-start;
+}
+.chat-bubble {
+    padding: 9px 13px;
+    border-radius: 12px;
+    font-size: 11.5px;
+    line-height: 1.6;
+    word-break: break-word;
+}
+.chat-bubble-user {
+    background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+    color: #ffffff;
+    border-bottom-right-radius: 4px;
+}
+.chat-bubble-bot {
+    background: #ffffff;
+    color: #1e293b;
+    border: 1px solid #e2e8f0;
+    border-bottom-left-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+    white-space: pre-wrap;
+}
+.chat-ts {
+    font-size: 9px;
+    color: #94a3b8;
+    margin-top: 3px;
+    padding: 0 2px;
+}
+
+/* ── Typing indicator ────────────────────────────────── */
+.chat-typing {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 9px 13px;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    border-bottom-left-radius: 4px;
+    width: fit-content;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+}
+.chat-typing-dot {
+    width: 7px;
+    height: 7px;
+    background: #94a3b8;
+    border-radius: 50%;
+    animation: typingBounce 1.2s infinite;
+}
+.chat-typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.chat-typing-dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes typingBounce {
+    0%,60%,100% { transform: translateY(0); opacity: 0.4; }
+    30%          { transform: translateY(-5px); opacity: 1; }
+}
+
+/* ── Quick suggestion chips ──────────────────────────── */
+.chat-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    padding: 8px 14px 4px;
+    background: #f8fafc;
+    border-top: 1px solid #f1f5f9;
+    flex-shrink: 0;
+}
+.chat-chip {
+    padding: 4px 10px;
+    border-radius: 20px;
+    border: 1px solid #e2e8f0;
+    background: #fff;
+    font-size: 9.5px;
+    color: #475569;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-weight: 500;
+}
+.chat-chip:hover {
+    background: #eff6ff;
+    border-color: #bfdbfe;
+    color: #1d4ed8;
+}
+
+/* ── Input bar ───────────────────────────────────────── */
+.chat-input-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    background: #ffffff;
+    border-top: 1px solid #e2e8f0;
+    flex-shrink: 0;
+}
+.chat-input {
+    flex: 1;
+    border: 1px solid #e2e8f0;
+    border-radius: 20px;
+    padding: 8px 14px;
+    font-size: 12px;
+    font-family: 'IBM Plex Sans', sans-serif;
+    background: #f8fafc;
+    color: #0f172a;
+    outline: none;
+    transition: border-color 0.15s;
+    resize: none;
+}
+.chat-input:focus {
+    border-color: #3b82f6;
+    background: #ffffff;
+}
+.chat-input::placeholder { color: #94a3b8; }
+.chat-send-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+    border: none;
+    color: #fff;
+    font-size: 14px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: all 0.15s;
+    box-shadow: 0 2px 8px rgba(59,130,246,0.35);
+}
+.chat-send-btn:hover {
+    transform: scale(1.08);
+    box-shadow: 0 4px 12px rgba(59,130,246,0.45);
+}
+.chat-footer {
+    text-align: center;
+    padding: 5px 0 8px;
+    font-size: 9px;
+    color: #cbd5e1;
+    background: #ffffff;
+    letter-spacing: 0.3px;
+    flex-shrink: 0;
+}
+</style>
+"""
+
+# ──────────────────────────────────────────────────────────
+#  CHATBOT SESSION STATE INIT  (call once at module level)
+# ──────────────────────────────────────────────────────────
+def _init_chat_state():
+    if "chat_open" not in st.session_state:
+        st.session_state.chat_open = False
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "chat_input_key" not in st.session_state:
+        st.session_state.chat_input_key = 0
+
+_init_chat_state()
+
+# ──────────────────────────────────────────────────────────
+#  INTENT ROUTER — maps user message → SQL + prompt context
+# ──────────────────────────────────────────────────────────
+def _route_intent(user_msg: str, batch_context: str | None):
+    """
+    Returns (sql_query: str | None, intent_label: str)
+    sql_query is None when no data fetch is needed.
+    """
+    m = user_msg.lower()
+
+    # ── Batch-specific improvement / how to fix ──────────
+    if batch_context and any(k in m for k in [
+        "improve", "fix", "release", "how to", "what should", "can i",
+        "what can", "recommend", "suggestion", "get to release", "move to release",
+        "change decision", "from reject", "from hold"
+    ]):
+        return f"""
+            SELECT
+                b.BATCH_ID, b.FINAL_DECISION, b.FAILURE_PROBABILITY,
+                b.CRITICAL_DEVIATION_COUNT, b.HIGH_DEVIATION_COUNT,
+                b.TOTAL_DEVIATIONS, b.TEMP_VIOLATION_COUNT,
+                b.FAILED_TEST_COUNT, b.OOS_COUNT,
+                b.FE_PASS_RATE_PCT, b.AI_DECISION_REASON,
+                b.TOP_RISK_FACTOR_1, b.TOP_RISK_FACTOR_2, b.TOP_RISK_FACTOR_3,
+                b.OVERALL_RISK_SCORE, b.FINANCIAL_RISK_SCORE,
+                b.TOTAL_COMMITTED_REVENUE, b.TOTAL_PENALTY_EXPOSURE,
+                f.PENALTY_RULE_ID, f.VIOLATION_TYPE, f.VIOLATION_CATEGORY,
+                f.ESTIMATED_PENALTY_USD,
+                f.AUTO_BLOCK_RELEASE, f.REGULATORY_HOLD_DAYS
+            FROM GOLD_V2.BATCH_FACT b
+            LEFT JOIN FEATURE_TEST.FEAT_FDA_RULE_VIOLATIONS f
+                ON b.BATCH_ID = f.BATCH_ID
+            WHERE b.BATCH_ID = '{batch_context}'
+            ORDER BY f.VIOLATION_CATEGORY NULLS LAST
+        """, "batch_improvement"
+
+    # ── Batch-specific detail ────────────────────────────
+    if batch_context and any(k in m for k in [
+        "this batch", "current batch", "batch detail", "tell me about",
+        "what's wrong", "whats wrong", "why is", "explain", "status",
+        "violation", "deviation"
+    ]):
+        return f"""
+            SELECT
+                b.BATCH_ID, b.PRODUCT_NAME, b.PRODUCT_TYPE,
+                b.FINAL_DECISION, b.FAILURE_PROBABILITY, b.RELEASE_SCORE,
+                b.CRITICAL_DEVIATION_COUNT, b.HIGH_DEVIATION_COUNT,
+                b.TOTAL_DEVIATIONS, b.TEMP_VIOLATION_COUNT,
+                b.FAILED_TEST_COUNT, b.OOS_COUNT, b.FE_PASS_RATE_PCT,
+                b.AI_DECISION_REASON, b.TOP_RISK_FACTOR_1,
+                b.TOP_RISK_FACTOR_2, b.TOP_RISK_FACTOR_3,
+                b.TOTAL_COMMITTED_REVENUE, b.TOTAL_PENALTY_EXPOSURE,
+                b.OVERALL_RISK_SCORE, b.BATCH_DATE
+            FROM GOLD_V2.BATCH_FACT b
+            WHERE b.BATCH_ID = '{batch_context}'
+        """, "batch_detail"
+
+    # ── Failed / rejected batches ────────────────────────
+    if any(k in m for k in [
+        "fail", "reject", "rejected", "failed batch", "which batch"
+    ]):
+        return """
+            SELECT
+                BATCH_ID, PRODUCT_NAME, PRODUCT_TYPE,
+                FINAL_DECISION, ROUND(FAILURE_PROBABILITY*100,1) AS FAIL_PCT,
+                CRITICAL_DEVIATION_COUNT, TEMP_VIOLATION_COUNT,
+                TOTAL_PENALTY_EXPOSURE, AI_DECISION_REASON,
+                TOP_RISK_FACTOR_1
+            FROM GOLD_V2.BATCH_FACT
+            WHERE FINAL_DECISION IN ('REJECT','HOLD')
+            ORDER BY FAILURE_PROBABILITY DESC
+            LIMIT 10
+        """, "failed_batches"
+
+    # ── High risk batches ────────────────────────────────
+    if any(k in m for k in ["high risk", "critical", "risky", "at risk"]):
+        return """
+            SELECT
+                BATCH_ID, PRODUCT_NAME, FINAL_DECISION,
+                ROUND(FAILURE_PROBABILITY*100,1) AS FAIL_PCT,
+                OVERALL_RISK_SCORE, CRITICAL_DEVIATION_COUNT,
+                TOTAL_PENALTY_EXPOSURE, TOP_RISK_FACTOR_1
+            FROM GOLD_V2.BATCH_FACT
+            WHERE OVERALL_RISK_SCORE > 0.6
+               OR FAILURE_PROBABILITY > 0.65
+            ORDER BY FAILURE_PROBABILITY DESC
+            LIMIT 10
+        """, "high_risk"
+
+    # ── FDA violations ───────────────────────────────────
+    if any(k in m for k in ["fda", "violation", "compliance", "cfr", "penalty rule"]):
+        base = """
+            SELECT
+                f.BATCH_ID, f.PENALTY_RULE_ID, f.CFR_REFERENCE,
+                f.VIOLATION_TYPE, f.VIOLATION_CATEGORY,
+                f.ESTIMATED_PENALTY_USD, f.AUTO_BLOCK_RELEASE,
+                f.REGULATORY_HOLD_DAYS
+            FROM FEATURE_TEST.FEAT_FDA_RULE_VIOLATIONS f
+        """
+        if batch_context:
+            return base + f" WHERE f.BATCH_ID = '{batch_context}' ORDER BY f.VIOLATION_CATEGORY", "fda_batch"
+        return base + " ORDER BY f.VIOLATION_CATEGORY, f.ESTIMATED_PENALTY_USD DESC LIMIT 15", "fda_all"
+
+    # ── Release ready / passing batches ─────────────────
+    if any(k in m for k in ["release", "released", "approved", "pass", "good batch"]):
+        return """
+            SELECT
+                BATCH_ID, PRODUCT_NAME, FINAL_DECISION,
+                ROUND(RELEASE_SCORE*100,1) AS RELEASE_SCORE_PCT,
+                ROUND(FAILURE_PROBABILITY*100,1) AS FAIL_PCT,
+                TOTAL_COMMITTED_REVENUE
+            FROM GOLD_V2.BATCH_FACT
+            WHERE FINAL_DECISION = 'RELEASE'
+            ORDER BY RELEASE_SCORE DESC
+            LIMIT 10
+        """, "released"
+
+    # ── Financial / revenue / penalty ────────────────────
+    if any(k in m for k in [
+        "revenue", "penalty", "financial", "money", "cost", "exposure",
+        "loss", "profit", "margin"
+    ]):
+        return """
+            SELECT
+                SUM(TOTAL_COMMITTED_REVENUE) AS TOTAL_REVENUE,
+                SUM(TOTAL_PENALTY_EXPOSURE)  AS TOTAL_PENALTY,
+                SUM(CASE WHEN FINAL_DECISION='REJECT' THEN TOTAL_PENALTY_EXPOSURE ELSE 0 END) AS REJECTED_PENALTY,
+                AVG(GROSS_MARGIN_PCT) AS AVG_MARGIN_PCT,
+                COUNT(*) AS TOTAL_BATCHES,
+                SUM(CASE WHEN FINAL_DECISION='RELEASE' THEN 1 ELSE 0 END) AS RELEASED,
+                SUM(CASE WHEN FINAL_DECISION='REJECT'  THEN 1 ELSE 0 END) AS REJECTED
+            FROM GOLD_V2.BATCH_FACT
+        """, "financial"
+
+    # ── Temperature / IoT ────────────────────────────────
+    if any(k in m for k in ["temperature", "temp", "sensor", "iot", "humidity", "pressure"]):
+        base = """
+            SELECT
+                BATCH_ID, PRODUCT_NAME, FINAL_DECISION,
+                TEMP_VIOLATION_COUNT, HUMIDITY_VIOLATION_COUNT,
+                PRESSURE_VIOLATION_COUNT, AVG_TEMP_DEVIATION_C, FAILURE_PROBABILITY
+            FROM GOLD_V2.BATCH_FACT
+        """
+        if batch_context:
+            return base + f" WHERE BATCH_ID = '{batch_context}'", "temp_batch"
+        return base + " ORDER BY TEMP_VIOLATION_COUNT DESC LIMIT 10", "temp_all"
+
+    # ── KPI summary ──────────────────────────────────────
+    if any(k in m for k in [
+        "summary", "overview", "kpi", "total", "how many", "count",
+        "dashboard", "report", "statistics"
+    ]):
+        return """
+            SELECT
+                COUNT(*) AS TOTAL_BATCHES,
+                SUM(CASE WHEN FINAL_DECISION='RELEASE' THEN 1 ELSE 0 END) AS RELEASED,
+                SUM(CASE WHEN FINAL_DECISION='REJECT'  THEN 1 ELSE 0 END) AS REJECTED,
+                SUM(CASE WHEN FINAL_DECISION='HOLD'    THEN 1 ELSE 0 END) AS ON_HOLD,
+                SUM(CASE WHEN FINAL_DECISION='RETEST'  THEN 1 ELSE 0 END) AS RETEST,
+                ROUND(AVG(FAILURE_PROBABILITY)*100,1) AS AVG_FAIL_PCT,
+                ROUND(AVG(RELEASE_SCORE)*100,1) AS AVG_RELEASE_SCORE,
+                SUM(TOTAL_COMMITTED_REVENUE) AS TOTAL_REVENUE,
+                SUM(TOTAL_PENALTY_EXPOSURE) AS TOTAL_PENALTY_EXPOSURE,
+                SUM(CRITICAL_DEVIATION_COUNT) AS TOTAL_CRITICAL_DEVS
+            FROM GOLD_V2.BATCH_FACT
+        """, "kpi_summary"
+
+    # ── Product-type analysis ────────────────────────────
+    if any(k in m for k in ["product", "tablet", "injection", "syrup", "type"]):
+        return """
+            SELECT
+                PRODUCT_TYPE,
+                COUNT(*) AS BATCH_COUNT,
+                ROUND(AVG(FAILURE_PROBABILITY)*100,1) AS AVG_FAIL_PCT,
+                SUM(CASE WHEN FINAL_DECISION='REJECT' THEN 1 ELSE 0 END) AS REJECTED,
+                SUM(TOTAL_COMMITTED_REVENUE) AS REVENUE,
+                SUM(TOTAL_PENALTY_EXPOSURE) AS PENALTY
+            FROM GOLD_V2.BATCH_FACT
+            GROUP BY PRODUCT_TYPE
+            ORDER BY AVG_FAIL_PCT DESC
+        """, "product_analysis"
+
+    # ── Deviation analysis ───────────────────────────────
+    if any(k in m for k in ["deviation", "critical dev", "quality", "oos", "out of spec"]):
+        base = """
+            SELECT
+                BATCH_ID, PRODUCT_NAME, FINAL_DECISION,
+                CRITICAL_DEVIATION_COUNT, HIGH_DEVIATION_COUNT,
+                TOTAL_DEVIATIONS, OOS_COUNT, FE_PASS_RATE_PCT,
+                AI_DECISION_REASON
+            FROM GOLD_V2.BATCH_FACT
+        """
+        if batch_context:
+            return base + f" WHERE BATCH_ID = '{batch_context}'", "deviation_batch"
+        return base + " ORDER BY CRITICAL_DEVIATION_COUNT DESC LIMIT 10", "deviation_all"
+
+    # ── Simulation hints ─────────────────────────────────
+    if any(k in m for k in ["simulate", "simulation", "what if", "parameter", "change"]):
+        return None, "simulation_hint"
+
+    # ── No specific intent matched ───────────────────────
+    return None, "general"
+
+
+# ──────────────────────────────────────────────────────────
+#  CORTEX AI CALL
+# ──────────────────────────────────────────────────────────
+def _call_cortex(user_question: str, data_rows, intent: str,
+                  batch_context: str | None, chat_history: list) -> str:
+
+    # ── Format retrieved data ────────────────────────────
+    data_section = ""
+    if data_rows is not None and len(data_rows) > 0:
+        rows_text = []
+        for _, row in data_rows.iterrows():
+            clean = {k: v for k, v in row.items() if str(v) not in ("nan", "None", "")}
+            rows_text.append(str(clean))
+        data_section = "\n\nRELEVANT DATA FROM SNOWFLAKE:\n" + "\n".join(rows_text[:15])
+
+    # ── Build conversation history snippet ───────────────
+    history_text = ""
+    if len(chat_history) > 1:
+        recent = chat_history[-4:]
+        history_text = "\n\nRECENT CONVERSATION:\n"
+        for msg in recent:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            history_text += f"{role}: {msg['content'][:200]}\n"
+
+    # ── Batch context sentence ───────────────────────────
+    ctx_sentence = ""
+    if batch_context:
+        ctx_sentence = f"\nThe user is currently viewing batch: {batch_context}. Treat this as the primary context unless they ask about something else.\n"
+
+    # ── Intent-specific instruction ──────────────────────
+    intent_instructions = {
+        "batch_improvement": """
+The user wants to know how to improve this batch from its current decision (REJECT or HOLD) to RELEASE.
+Analyze the specific violations, deviations, and risk factors from the data.
+Give CONCRETE, actionable steps — be specific about which parameters need to change and by how much.
+Structure your response as: 1) Why it was rejected/held, 2) Key issues to fix, 3) Specific recommendations.
+Also mention the Simulation Lab where they can test parameter changes.
+        """,
+        "batch_detail": """
+Give a comprehensive but concise summary of this batch's quality status.
+Highlight the most critical issues and explain what they mean in plain business language.
+        """,
+        "failed_batches": """
+Summarize the failed/rejected batches. Identify common patterns in why they failed.
+Group by root cause if possible.
+        """,
+        "financial": """
+Give a financial intelligence summary. Highlight penalty exposure vs revenue.
+Flag any batches where penalty risk is disproportionately high.
+        """,
+        "fda_all": """
+Summarize the FDA compliance picture. Which rule categories are most frequently violated?
+What is the total penalty exposure? Which violations auto-block release?
+        """,
+        "simulation_hint": """
+Explain how the Simulation Lab works in this application.
+The Simulation Lab allows users to adjust 10 key quality parameters (temperature violations,
+humidity violations, pressure violations, failed tests, OOS count, borderline count,
+pass rate, critical deviations, high deviations, process variance) and run an XGBoost ML model
+to predict the new failure probability and release decision.
+Tell them to click "Simulation Lab" button on the dashboard to access it.
+        """,
+        "kpi_summary": """
+Give a clear executive summary of the overall batch release performance.
+Calculate and mention the release rate, rejection rate, and key financial figures.
+Flag the most concerning metrics.
+        """,
+    }
+    intent_instr = intent_instructions.get(intent, "Answer the user's question helpfully using the data provided.")
+
+    system_prompt = f"""You are PHARMA COPILOT AI, an enterprise-grade pharmaceutical batch release intelligence assistant built on Snowflake.
+
+Your role: Help quality managers, QA directors, and operations teams make smart, compliant batch release decisions using real data from a Snowflake-powered pharmaceutical intelligence platform.
+
+PLATFORM CONTEXT:
+- The platform monitors pharmaceutical batch manufacturing and QA decisions
+- Batches are scored by an XGBoost ML model producing FAILURE_PROBABILITY (0-1) and RELEASE_SCORE
+- Final decisions: RELEASE, REJECT, HOLD, RETEST
+- Risk levels: CRITICAL, HIGH, MEDIUM, LOW
+- FDA compliance: 21 CFR Part 11 monitoring with rules like FDA-PEN-001 (lab failure), FDA-PEN-002 (cold chain/temperature), FDA-PEN-003 (sterility/critical deviation), FDA-PEN-005 (uninvestigated deviation), FDA-PEN-009 (endotoxin)
+- The Simulation Lab lets users adjust parameters and re-run the ML model to simulate improved outcomes
+{ctx_sentence}
+TASK FOR THIS RESPONSE:
+{intent_instr}
+
+FORMATTING RULES:
+- Be concise but thorough — business users want actionable insights, not lengthy reports
+- Use plain numbers and percentages when referencing data
+- For improvement recommendations, be specific (e.g. "Reduce temperature violations from 8 to below 2")
+- Always mention relevant risk or financial impact when available
+- If data shows critical deviations or sterility failures, emphasize these as top priority
+- End with one actionable next step when possible
+- Do NOT use markdown headers with # — use plain text with line breaks
+- Keep response under 350 words unless the question requires more detail
+{data_section}
+{history_text}
+"""
+
+    full_prompt = system_prompt + "\n\nUser: " + user_question + "\nAssistant:"
+
+    # ── Escape single quotes to prevent SQL errors ────────
+    safe_prompt = full_prompt.replace("\\", "\\\\").replace("'", "\\'")
+
+    try:
+        result = session.sql(
+            f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{safe_prompt}') AS REPLY"
+        ).to_pandas()
+        return result["REPLY"].iloc[0].strip()
+    except Exception as e:
+        return f"AI service error: {str(e)}. Please try again."
+
+# ──────────────────────────────────────────────────────────
+#  PROCESS USER MESSAGE (data fetch + AI)
+# ──────────────────────────────────────────────────────────
+def _process_chat_message(user_msg: str, batch_context: str | None) -> str:
+    """Fetch relevant data then call Cortex. Returns AI response string."""
+    sql, intent = _route_intent(user_msg, batch_context)
+
+    data_df = None
+    if sql:
+        try:
+            data_df = session.sql(sql).to_pandas()
+        except Exception as e:
+            data_df = None
+
+    return _call_cortex(
+        user_question=user_msg,
+        data_rows=data_df,
+        intent=intent,
+        batch_context=batch_context,
+        chat_history=st.session_state.chat_history,
+    )
+
+
+# ──────────────────────────────────────────────────────────
+#  RENDER CHATBOT  ← call this at end of dashboard/simulation
+# ──────────────────────────────────────────────────────────
+
+def render_chatbot(batch_context: str | None = None):
+    import datetime
+
+    # ── INIT STATE ────────────────────────────────────────
+    if "chat_open" not in st.session_state:
+        st.session_state.chat_open = False
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "chat_input_key" not in st.session_state:
+        st.session_state.chat_input_key = 0
+
+   
+
+    st.markdown("""
+    <style>
+    .chat-sidebar-header {
+    background:
+        linear-gradient(
+            135deg,
+            #0f172a 0%,
+            #172554 50%,
+            #1e293b 100%
+        );
+
+    border-radius: 22px 22px 0 0;
+
+    padding: 18px 20px;
+
+    display: flex;
+    align-items: center;
+    gap: 14px;
+
+    margin-bottom: 0;
+
+    box-shadow:
+        0 10px 25px rgba(15,23,42,0.18);
+    }
+    .chat-sidebar-avatar {
+    width: 46px;
+    height: 46px;
+
+    border-radius: 14px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #3b82f6 0%,
+            #2563eb 100%
+        );
+
+    display:flex;
+    align-items:center;
+    justify-content:center;
+
+    font-size:20px;
+
+    box-shadow:
+        0 8px 20px rgba(59,130,246,0.35);
+    }
+    .chat-sidebar-title {
+        font-size: 13px; font-weight: 700;
+        color: #f8fafc; line-height: 1.2;
+    }
+    .chat-sidebar-sub {
+        font-size: 10px; color: #64748b; margin-top: 1px;
+        display: flex; align-items: center; gap: 4px;
+    }
+    .chat-online-dot {
+        width: 6px; height: 6px; background: #22c55e;
+        border-radius: 50%; display: inline-block;
+    }
+    .chat-ctx-pill {
+        background: #fffbeb; border: 1px solid #fde68a;
+        border-radius: 6px; padding: 5px 10px;
+        font-size: 10px; color: #78350f; margin-bottom: 6px;
+    }
+   .chat-msg-area {
+    background:
+        linear-gradient(
+            180deg,
+            rgba(255,255,255,0.95) 0%,
+            rgba(248,250,252,0.96) 100%
+        );
+
+    border: 1px solid rgba(255,255,255,0.7);
+
+    border-radius: 22px;
+
+    padding: 18px;
+
+    overflow-y: auto;
+
+    max-height: 520px;
+    min-height: 520px;
+
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+
+    margin-bottom: 10px;
+
+    backdrop-filter: blur(18px);
+
+    box-shadow:
+        0 10px 35px rgba(15,23,42,0.08),
+        inset 0 1px 0 rgba(255,255,255,0.7);
+    }
+    .chat-msg-area::-webkit-scrollbar { width: 3px; }
+    .chat-msg-area::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 4px; }
+   /* ─────────────────────────────────────────
+       PREMIUM GPT INPUT
+    ───────────────────────────────────────── */
+    
+    div[data-testid="stTextInput"] input {
+
+    height: 54px !important;
+
+    min-height: 54px !important;
+
+    border-radius: 18px !important;
+
+    border: 1px solid #dbe3ef !important;
+
+    background:
+        linear-gradient(
+            180deg,
+            rgba(255,255,255,0.98) 0%,
+            rgba(248,250,252,0.98) 100%
+        ) !important;
+
+    font-size: 15px !important;
+
+    font-weight: 500 !important;
+
+    color: #0f172a !important;
+
+    padding: 0 18px !important;
+
+    line-height: 54px !important;
+
+    box-sizing: border-box !important;
+
+    box-shadow:
+        0 4px 14px rgba(15,23,42,0.04),
+        inset 0 1px 0 rgba(255,255,255,0.8) !important;
+
+    transition: all 0.18s ease !important;
+}
+div[data-testid="stTextInput"] {
+
+    margin-bottom: 0 !important;
+}
+
+div[data-testid="stTextInput"] > div {
+
+    height: 54px !important;
+}
+    div[data-testid="stTextInput"] input:focus {
+    
+        border: 1px solid #7c3aed !important;
+    
+        background: #ffffff !important;
+    
+        box-shadow:
+            0 0 0 4px rgba(124,58,237,0.10),
+            0 10px 24px rgba(124,58,237,0.12) !important;
+    }
+    
+    div[data-testid="stTextInput"] input::placeholder {
+    
+        color: #94a3b8 !important;
+    
+        font-size: 16px !important;
+    
+        font-weight: 500 !important;
+    }
+    
+    /* ─────────────────────────────────────────
+       PREMIUM SEND BUTTON
+    ───────────────────────────────────────── */
+    /* ═══════════════════════════════════════════════════
+   BUTTONS — clean enterprise style
+═══════════════════════════════════════════════════ */
+
+/* All buttons base */
+div[data-testid="stButton"] > button {
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+    font-size: 12px !important;
+    height: 38px !important;
+    transition: all 0.18s ease !important;
+    letter-spacing: 0.2px !important;
+    font-family: var(--font-ui) !important;
+    cursor: pointer !important;
+    border: none !important;
+    padding: 0 18px !important;
+}
+
+/* PRIMARY button — Simulate Predictions */
+div[data-testid="stButton"] > button[kind="primary"] {
+    background: linear-gradient(135deg, #1e40af 0%, #2563eb 100%) !important;
+    color: #ffffff !important;
+    border: none !important;
+    box-shadow: 0 2px 8px rgba(37,99,235,0.28) !important;
+}
+div[data-testid="stButton"] > button[kind="primary"]:hover {
+    background: linear-gradient(135deg, #1d4ed8 0%, #3b82f6 100%) !important;
+    box-shadow: 0 4px 14px rgba(37,99,235,0.38) !important;
+    transform: translateY(-1px) !important;
+}
+div[data-testid="stButton"] > button[kind="primary"]:active {
+    transform: translateY(0px) !important;
+    box-shadow: 0 1px 4px rgba(37,99,235,0.20) !important;
+}
+
+/* SECONDARY button — Reset, Dashboard, Back */
+div[data-testid="stButton"] > button:not([kind="primary"]) {
+    background: #ffffff !important;
+    border: 1px solid #e2e8f0 !important;
+    color: #374151 !important;
+    box-shadow: 0 1px 3px rgba(15,23,42,0.06) !important;
+}
+div[data-testid="stButton"] > button:not([kind="primary"]):hover {
+    background: #f8fafc !important;
+    border-color: #cbd5e1 !important;
+    color: #0f172a !important;
+    box-shadow: 0 2px 8px rgba(15,23,42,0.08) !important;
+    transform: translateY(-1px) !important;
+}
+div[data-testid="stButton"] > button:not([kind="primary"]):active {
+    transform: translateY(0) !important;
+    background: #f1f5f9 !important;
+}
+
+/* Selectbox — keep consistent */
+div[data-testid="stSelectbox"] > div > div {
+    border-radius: 10px !important;
+    border: 1px solid #e2e8f0 !important;
+    background: #ffffff !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    color: #0f172a !important;
+    height: 38px !important;
+    box-shadow: 0 1px 3px rgba(15,23,42,0.04) !important;
+}
+   /* ─────────────────────────────────────────
+   PREMIUM GPT INPUT
+───────────────────────────────────────── */
+
+div[data-testid="stTextInput"] input {
+
+    height: 54px !important;
+
+    border-radius: 18px !important;
+
+    border: 1px solid #dbe3ef !important;
+
+    background:
+        linear-gradient(
+            180deg,
+            rgba(255,255,255,0.98) 0%,
+            rgba(248,250,252,0.98) 100%
+        ) !important;
+
+    font-size: 16px !important;
+
+    font-weight: 500 !important;
+
+    color: #0f172a !important;
+
+    padding-left: 18px !important;
+
+    padding-right: 20px !important;
+
+    box-shadow:
+        0 4px 14px rgba(15,23,42,0.04),
+        inset 0 1px 0 rgba(255,255,255,0.8) !important;
+
+    transition: all 0.18s ease !important;
+}
+
+div[data-testid="stTextInput"] input:focus {
+
+    border: 1px solid #7c3aed !important;
+
+    background: #ffffff !important;
+
+    box-shadow:
+        0 0 0 4px rgba(124,58,237,0.10),
+        0 10px 24px rgba(124,58,237,0.12) !important;
+}
+
+div[data-testid="stTextInput"] input::placeholder {
+
+    color: #94a3b8 !important;
+
+    font-size: 16px !important;
+
+    font-weight: 500 !important;
+}
+
+/* ─────────────────────────────────────────
+   PREMIUM SEND BUTTON
+───────────────────────────────────────── */
+
+
+
+
+    .chat-bubble-bot {
+    background:
+        linear-gradient(
+            135deg,
+            #ffffff 0%,
+            #f8fbff 100%
+        );
+
+    color: #1e293b;
+
+    border: 1px solid #dbeafe;
+
+    padding: 14px 16px;
+
+    border-radius: 18px 18px 18px 6px;
+
+    font-size: 13px;
+
+    line-height: 1.75;
+
+    white-space: pre-wrap;
+
+    max-width: 88%;
+
+    box-shadow:
+        0 6px 18px rgba(59,130,246,0.08);
+    }
+    .chat-ts-r { font-size: 9px; color: #94a3b8; text-align: right; margin-top: 2px; }
+    .chat-ts-l { font-size: 9px; color: #94a3b8; text-align: left;  margin-top: 2px; }
+    
+   
+  
+    .chat-footer-txt {
+        text-align: center; font-size: 9px; color: #cbd5e1;
+        letter-spacing: 0.3px; padding-top: 4px;
+        border-top: 1px solid #f1f5f9; margin-top: 4px;
+    }
+    /* Shrink streamlit form padding inside sidebar */
+    section[data-testid="stSidebar"] { display: none !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # # ── TOGGLE BUTTON — floated bottom-right ─────────────
+    # st.markdown(f"""
+    # <style>
+    # .chat-toggle-fab {{
+    #     position: fixed; bottom: 28px; right: 28px;
+    #     width: 52px; height: 52px; border-radius: 50%;
+    #     background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+    #     display: flex; align-items: center; justify-content: center;
+    #     font-size: 20px; z-index: 9999; cursor: pointer;
+    #     box-shadow: 0 4px 18px rgba(59,130,246,0.45);
+    #     border: none; color: white;
+    # }}
+    # </style>
+    # """, unsafe_allow_html=True)
+
+    # Render the toggle button as a Streamlit button in top-right
+    tog_col1, tog_col2 = st.columns([9, 1])
+    with tog_col2:
+        toggle_label = "✕ Close" if st.session_state.chat_open else "💬 Chat"
+        if st.button(toggle_label, key="chat_fab_btn", use_container_width=True):
+            st.session_state.chat_open = not st.session_state.chat_open
+            st.rerun()
+
+    if not st.session_state.chat_open:
+        return
+
+    # ── WELCOME MSG ───────────────────────────────────────
+    if not st.session_state.chat_history:
+        welcome = (
+            "👋 Hello! I'm your Pharma Copilot AI.\n\n"
+            "I have real-time access to your batch data, FDA violations, "
+            "financial exposure, and ML model insights.\n\n"
+            "Ask me anything — like:\n"
+            "• Which batches are at highest risk today?\n"
+            "• Why was batch B-1023 rejected?\n"
+            "• How can I improve this batch to release?\n"
+            "• What is our total penalty exposure?"
+        )
+        if batch_context:
+            welcome += f"\n\n📌 I can see you're viewing batch {batch_context}."
+        st.session_state.chat_history.append({
+            "role": "assistant", "content": welcome,
+            "time": datetime.datetime.now().strftime("%H:%M")
+        })
+
+    # ── SIDEBAR PANEL ─────────────────────────────────────
+    # Use a container so everything is grouped
+    with st.container():
+        # Header
+        st.markdown(f"""
+        <div class="chat-sidebar-header">
+            <div class="chat-sidebar-avatar">⚗️</div>
+            <div>
+                <div class="chat-sidebar-title">Pharma Copilot AI</div>
+                <div class="chat-sidebar-sub">
+                    <span class="chat-online-dot"></span>
+                    Cortex · mistral-large2 · Live data
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Context pill
+        if batch_context:
+            st.markdown(
+                f'<div class="chat-ctx-pill">📌 Batch context: <b>{batch_context}</b></div>',
+                unsafe_allow_html=True
+            )
+
+        # Messages
+        msgs_html = '<div class="chat-msg-area" id="chat-msgs">'
+        for msg in st.session_state.chat_history:
+            content = msg["content"].replace("<", "&lt;").replace(">", "&gt;")
+            ts = msg.get("time", "")
+            if msg["role"] == "user":
+                msgs_html += (
+                    f'<div style="display:flex;flex-direction:column;align-items:flex-end;">'
+                    f'<div class="chat-bubble-user">{content}</div>'
+                    f'<div class="chat-ts-r">{ts}</div></div>'
+                )
+            else:
+                msgs_html += (
+                    f'<div style="display:flex;flex-direction:column;align-items:flex-start;">'
+                    f'<div class="chat-bubble-bot">{content}</div>'
+                    f'<div class="chat-ts-l">🤖 Copilot AI · {ts}</div></div>'
+                )
+        msgs_html += '</div>'
+        st.markdown(msgs_html, unsafe_allow_html=True)
+
+       
+
+        # ── CHAT INPUT ROW ─────────────────────────────
+        chat_input_col, clear_col = st.columns([0.92, 0.08], gap="small")
+        
+        with chat_input_col:
+        
+            input_inner_col, send_inner_col = st.columns([0.90, 0.10], gap="small")
+        
+            with input_inner_col:
+                user_input = st.text_input(
+                    "",
+                    placeholder="Ask anything about batches, FDA, revenue...",
+                    key=f"chat_input_{st.session_state.chat_input_key}",
+                    label_visibility="collapsed"
+                )
+        
+            with send_inner_col:
+                send_clicked = st.button(
+                    "➤",
+                    key="chat_send_btn",
+                    use_container_width=True
+                )
+        
+        with clear_col:
+            clear_clicked = st.button(
+                "🗑️",
+                key="chat_clear_btn",
+                use_container_width=True
+            )
+        
+        # ── SEND MESSAGE ───────────────────────────────
+        if send_clicked and user_input.strip():
+        
+            st.session_state.chat_history.append({
+                "role": "user",
+                "content": user_input.strip(),
+                "time": datetime.datetime.now().strftime("%H:%M")
+            })
+        
+            with st.spinner("Thinking..."):
+                reply = _process_chat_message(user_input.strip(), batch_context)
+        
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": reply,
+                "time": datetime.datetime.now().strftime("%H:%M")
+            })
+        
+            st.session_state.chat_input_key += 1
+            st.rerun()
+        
+        # ── CLEAR CHAT ─────────────────────────────────
+        if clear_clicked:
+            st.session_state.chat_history = []
+            st.session_state.chat_input_key += 1
+            st.rerun()
+        
+        # ── FOOTER ─────────────────────────────────────
+        st.markdown(
+            '<div class="chat-footer-txt">Powered by Snowflake Cortex · FDA 21 CFR Part 11 Ready</div>',
+            unsafe_allow_html=True
+        )
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED CSS
+# ─────────────────────────────────────────────────────────────────────────────
+SHARED_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;600;700&display=swap');
+*, *::before, *::after { box-sizing: border-box; }
+html, body, [class*="css"], .stApp {
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    background: #f1f5f9 !important; font-size: 13px; color: #1e293b;
+}
+#MainMenu, footer, header { visibility: hidden; }
+.block-container { padding: 10px 18px 10px 18px !important; max-width: 100% !important; }
+section.main > div { padding-bottom: 0 !important; }
+.element-container { margin-bottom: 0 !important; }
+[data-testid="stVerticalBlock"] > div { gap: 0 !important; }
+[data-testid="column"] { padding: 0 5px !important; }
+[data-testid="stSelectbox"] label, [data-testid="stRadio"] label { display: none !important; }
+[data-testid="stSelectbox"] > div > div {
+    min-height: 45px !important;
+
+    padding: 10px 14px !important;
+
+    display: flex !important;
+    align-items: center !important;
+
+    border-radius: 16px !important;
+
+    border: 1px solid #dbeafe !important;
+
+    background: linear-gradient(
+        135deg,
+        #ffffff 0%,
+        #eff6ff 100%
+    ) !important;
+
+    font-size: 15px !important;
+    font-weight: 500 !important;
+
+    color: #334155 !important;
+
+    box-shadow:
+        0 2px 8px rgba(15,23,42,0.04) !important;
+}
+
+/* Topbar */
+.topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    background: linear-gradient(
+        135deg,
+        #0f172a 0%,
+        #172554 45%,
+        #1e3a8a 100%
+    );
+
+    border-radius: 22px;
+    padding: 18px 28px;
+    margin-bottom: 18px;
+
+    border: 1px solid rgba(255,255,255,0.08);
+
+    box-shadow:
+        0 10px 30px rgba(15,23,42,0.18),
+        inset 0 1px 0 rgba(255,255,255,0.05);
+
+    position: relative;
+    overflow: hidden;
+}
+.topbar::after {
+    content: '';
+    position: absolute;
+
+    width: 340px;
+    height: 340px;
+
+    background: radial-gradient(
+        circle,
+        rgba(59,130,246,0.18) 0%,
+        transparent 70%
+    );
+
+    top: -170px;
+    right: -120px;
+
+    pointer-events: none;
+}
+.topbar-left { display: flex; align-items: center; gap: 12px; }
+.topbar-icon {
+    width: 36px; height: 36px; border-radius: 9px;
+    background: linear-gradient(135deg, #f59e0b, #d97706);
+    display: flex; align-items: center; justify-content: center; font-size: 16px;
+    box-shadow: 0 2px 8px rgba(217,119,6,0.4);
+}
+.topbar-title {
+    color: #ffffff;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    line-height: 1.2;
+}
+.topbar-sub {
+    color: rgba(226,232,240,0.72);
+    font-size: 11px;
+    letter-spacing: 0.8px;
+    margin-top: 3px;
+    text-transform: uppercase;
+}
+.topbar-right { display: flex; align-items: center; gap: 8px; }
+.live-dot {
+    width: 7px; height: 7px; background: #22c55e; border-radius: 50%;
+    display: inline-block; margin-right: 5px; box-shadow: 0 0 6px rgba(34,197,94,0.6);
+    animation: blink 2s infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
+.pill { padding: 4px 11px; border-radius: 20px; font-size: 10px; font-weight: 600; letter-spacing: 0.3px; }
+.pill-live { background: rgba(34,197,94,0.12); border: 1px solid rgba(34,197,94,0.25); color: #86efac; }
+.pill-fda  { background: rgba(245,158,11,0.12); border: 1px solid rgba(245,158,11,0.25); color: #fcd34d; }
+
+/* KPI */
+.kpi-strip { display: flex; gap: 8px; margin-bottom: 14px; }
+.kpi-card {
+    flex: 1;
+    border-radius: 18px;
+    padding: 18px 20px 16px;
+    border: 1px solid #e2e8f0;
+    position: relative;
+    overflow: hidden;
+    transition: all 0.25s ease;
+
+    box-shadow: 0 4px 14px rgba(15,23,42,0.05);
+}
+.kpi-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 10px 24px rgba(15,23,42,0.10);
+}
+.kpi-card::after {
+    content: ''; position: absolute; bottom: 0; left: 0; right: 0;
+    height: 3px; border-radius: 0 0 10px 10px;
+}
+.kc0 {
+    background: linear-gradient(135deg, #ffffff 0%, #eff6ff 100%);
+}
+
+.kc1 {
+    background: linear-gradient(135deg, #ffffff 0%, #ecfdf5 100%);
+}
+
+.kc2 {
+    background: linear-gradient(135deg, #ffffff 0%, #fef2f2 100%);
+}
+
+.kc3 {
+    background: linear-gradient(135deg, #ffffff 0%, #fff7ed 100%);
+}
+
+.kc4 {
+    background: linear-gradient(135deg, #ffffff 0%, #f5f3ff 100%);
+}
+.kpi-lbl { font-size: 10px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+.kpi-val { font-family: 'IBM Plex Mono', monospace; font-size: 26px; font-weight: 700; color: #0f172a; line-height: 1.1; margin-bottom: 2px; }
+.kpi-sub { font-size: 9px; color: #cbd5e1; }
+
+/* Buttons */
+button[kind="secondary"] {
+    border-radius: 16px !important;
+
+    padding: 8px 18px !important;
+
+    font-size: 15px !important;
+    font-weight: 600 !important;
+
+    background: linear-gradient(
+        135deg,
+        #ffffff 0%,
+        #eff6ff 100%
+    ) !important;
+
+    border: 1px solid #dbeafe !important;
+
+    color: #475569 !important;
+
+    height: 46px !important;
+    min-height: 46px !important;
+
+    line-height: 1 !important;
+
+    box-shadow:
+        0 2px 8px rgba(15,23,42,0.04),
+        inset 0 1px 0 rgba(255,255,255,0.8) !important;
+
+    transition: all 0.25s ease !important;
+}
+button[kind="secondary"]:hover {
+    transform: translateY(-2px) !important;
+
+    background: linear-gradient(
+        135deg,
+        #eff6ff 0%,
+        #dbeafe 100%
+    ) !important;
+
+    border-color: #93c5fd !important;
+
+    color: #1e3a8a !important;
+
+    box-shadow:
+        0 8px 18px rgba(59,130,246,0.14) !important;
+}
+button[kind="secondary"]:focus,
+button[kind="secondary"][aria-pressed="true"] {
+    background: linear-gradient(
+        135deg,
+        #2563eb 0%,
+        #1d4ed8 100%
+    ) !important;
+
+    color: #ffffff !important;
+
+    border-color: #2563eb !important;
+
+    box-shadow:
+        0 8px 20px rgba(37,99,235,0.24) !important;
+}
+/* ── HERO BANNER ─────────────────────────────────────── */
+.hero-banner {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    overflow: hidden;
+    display: flex;
+    align-items: stretch;
+    margin-bottom: 18px;
+}
+.hero-accent-bar {
+    width: 4px;
+    flex-shrink: 0;
+}
+.hero-body {
+    flex: 1;
+    padding: 14px 18px 14px 16px;
+    display: flex;
+    align-items: center;
+    gap: 0;
+}
+.hero-left {
+    width: 210px;
+    flex-shrink: 0;
+    padding-right: 16px;
+}
+.hero-batch-id {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: #94a3b8;
+    letter-spacing: 0.7px;
+    margin-bottom: 4px;
+}
+.hero-product {
+    font-size: 15px;
+    font-weight: 700;
+    color: #0f172a;
+    line-height: 1.3;
+    margin-bottom: 10px;
+}
+.hero-risk-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: #fef2f2;
+    border: 1px solid #fca5a5;
+    color: #b91c1c;
+    border-radius: 6px;
+    padding: 4px 9px;
+    font-size: 10.5px;
+    font-weight: 600;
+}
+.hero-divider {
+    width: 1px;
+    background: #e2e8f0;
+    align-self: stretch;
+    flex-shrink: 0;
+    margin: 0 16px;
+}
+.hero-cards-wrap {
+    flex: 1;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    align-items: stretch;
+}
+.hero-mini-card {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    min-width: 0;
+}
+.hero-mini-card.card-plant { border-top: 2px solid #7f77dd; }
+.hero-mini-card.card-type  { border-top: 2px solid #1d9e75; }
+.hero-mini-card.card-date  { border-top: 2px solid #378add; }
+.hero-mini-card.card-rev {
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+    border-top: 2px solid #ef9f27;
+}
+.hero-card-icon-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 7px;
+}
+.hero-card-icon {
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-size: 13px;
+}
+.hero-mini-label {
+    font-size: 9.5px;
+    font-weight: 700;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+.hero-mini-value {
+    font-size: 13px;
+    font-weight: 700;
+    color: #0f172a;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.hero-right {
+    width: 136px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    text-align: center;
+}
+.hero-fp-label {
+    font-size: 9.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: #94a3b8;
+}
+.hero-fp-ring {
+    position: relative;
+    width: 72px;
+    height: 72px;
+}
+.hero-fp-ring svg {
+    transform: rotate(-90deg);
+}
+.hero-fp-inner {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    font-weight: 700;
+    font-family: 'IBM Plex Mono', monospace;
+}
+.hero-fp-value { font-family: 'IBM Plex Mono', monospace; font-size: 32px; font-weight: 700; line-height: 1; }
+.hero-fp-tag { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; margin-top: 4px; }
+.hero-mini-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+}
+.hero-product-name {
+    font-size: 17px;
+    font-weight: 600;
+    color: #0f172a;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+.hero-mini-cards {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+.hero-mini-card{
+    flex:1;
+
+    min-width:155px;
+    max-width:210px;
+
+    background:#f8fafc;
+
+    border:1px solid #dbe3ee;
+    border-radius:14px;
+
+    padding:12px 16px;
+
+    box-shadow:
+        0 1px 2px rgba(15,23,42,0.04);
+
+    transition:all 0.18s ease;
+}
+.hero-mini-label{
+    font-size:10px;
+
+    color:#94a3b8;
+
+    text-transform:uppercase;
+
+    letter-spacing:0.5px;
+
+    font-weight:700;
+
+    margin-bottom:6px;
+
+    white-space:nowrap;
+}
+.hero-mini-value{
+    font-size:13px;
+
+    color:#0f172a;
+
+    font-weight:700;
+
+    line-height:1.2;
+
+    white-space:nowrap;
+}
+.hero-mini-card.card-rev .hero-mini-value { color: #78350f; }
+.hero-right {
+    width: 120px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    text-align: center;
+}
+
+.hero-risk-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: #fef2f2;
+    border: 1px solid #fca5a5;
+    color: #b91c1c;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+.hero-divider {
+    width: 1px;
+    background: #e2e8f0;
+    align-self: stretch;
+    flex-shrink: 0;
+}
+.hero-cards-wrap {
+    flex: 1;
+    display: flex;
+    justify-content: flex-start;   /* was flex-end */
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+/* Panels */
+.panel { background: #fff; border-radius: 10px; border: 1px solid #e2e8f0; box-shadow: 0 1px 5px rgba(0,0,0,0.05); overflow: hidden; }
+.panel-hd {
+    padding: 10px 14px; border-bottom: 1px solid #f1f5f9; font-size: 10px; font-weight: 700;
+    color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; background: #fafafa;
+    display: flex; align-items: center; justify-content: space-between;
+}
+.panel-hd-count { font-size: 10px; color: #cbd5e1; font-weight: 500; background: #f1f5f9; padding: 2px 8px; border-radius: 20px; }
+.bscroll {
+    overflow-y: auto;
+    height: 540px;
+    min-height: 540px;
+    max-height: 540px;
+    overflow-x: hidden;
+}
+.bscroll::-webkit-scrollbar {
+    width: 6px;
+}
+
+.bscroll::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 20px;
+}
+
+.bscroll::-webkit-scrollbar-track {
+    background: transparent;
+}
+.bscroll::-webkit-scrollbar { width: 3px; }
+.bscroll::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 4px; }
+.bitem { padding: 10px 14px; border-bottom: 1px solid #f8fafc; transition: background 0.1s; cursor: pointer; }
+.bitem:hover { background: #dbeafe ; }
+.bitem-sel { background: #fffbeb !important; border-left: 3px solid #d97706; padding-left: 11px; }
+.bitem-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px; }
+.bid { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 700; color: #0f172a; }
+.bname { font-size: 10px; color: #64748b; margin-left: 5px; }
+.bmeta { font-size: 9px; color: #94a3b8; display: flex; align-items: center; gap: 5px; }
+
+/* Badges */
+.badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border-radius: 6px;
+    padding: 3px 12px;
+    font-size: 10.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+}
+.b-release { background:#dcfce7; border:1px solid #86efac; color:#15803d; }
+.b-reject  { background:#fef2f2; border:1px solid #fca5a5; color:#b91c1c; }
+.b-hold    { background:#fef3c7; border:1px solid #fde68a; color:#b45309; }
+.b-retest  { background:#eff6ff; border:1px solid #bfdbfe; color:#1d4ed8; }
+
+/* Detail panel */
+.dpanel {
+    background: #fff;
+    border-radius: 10px;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 1px 5px rgba(0,0,0,0.05);
+    padding: 18px 20px;
+    overflow-y: auto;
+    box-sizing: border-box;
+
+    height: 540px;
+    min-height: 540px;
+    max-height: 540px;
+}
+.dpanel::-webkit-scrollbar { width: 3px; }
+.dpanel::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 4px; }
+
+/* Score ring */
+.sc-row { display: flex; gap: 20px; align-items: flex-start; margin-bottom: 16px; }
+.sc-circle-wrap { flex-shrink: 0; text-align: center; }
+.sc-ring { width: 88px; height: 88px; border-radius: 50%; display: flex; align-items: center; justify-content: center; box-shadow: 0 3px 12px rgba(0,0,0,0.1); }
+.sc-inner { width: 64px; height: 64px; background: #fff; border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.sc-num { font-family: 'IBM Plex Mono', monospace; font-size: 20px; font-weight: 700; color: #0f172a; line-height: 1; }
+.sc-sub { font-size: 8px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.3px; margin-top: 1px; }
+.sc-lbl { font-size: 9px; font-weight: 700; color: #64748b; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.4px; }
+.rbadge { display: inline-flex; align-items: center; padding: 3px 10px; border-radius: 20px; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; margin-top: 5px; }
+.r-low    { background: #dcfce7; color: #15803d; border: 1px solid #bbf7d0; }
+.r-medium { background: #fef3c7; color: #b45309; border: 1px solid #fde68a; }
+.r-high   { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+.donut-wrap { flex-shrink: 0; text-align: center; }
+.donut-legend { margin-top: 6px; text-align: left; }
+.legend-item { display: flex; align-items: center; gap: 5px; font-size: 9px; color: #64748b; margin-bottom: 3px; }
+.legend-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+
+/* Metrics strip */
+.mstrip { display: flex; gap: 6px; margin-bottom: 14px; }
+.mbox {
+    flex: 1;
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 18px;
+    padding: 18px;
+    box-shadow: 0 2px 10px rgba(15,23,42,0.04);
+}
+.mbox-val { 
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 24px;
+    font-weight: 700;
+    color: #0f172a;
+    line-height: 1.1;
+}
+.mbox-lbl { 
+    font-size: 9px;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    margin-top: 6px;
+    font-weight: 600;
+}
+.hdiv { height: 1px; background: #f1f5f9; margin: 12px 0; }
+
+/* Rule override tag */
+.override-tag { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 6px; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; background: #fff7ed; color: #c2410c; border: 1px solid #fed7aa; margin-bottom: 8px; }
+
+/* AI box */
+.aibox { background: linear-gradient(135deg, #f0f9ff, #e0f2fe); border: 1px solid #bae6fd; border-left: 3px solid #0284c7; border-radius: 8px; padding: 11px 14px; margin-top: 12px; }
+.aibox-hd { font-size: 9px; font-weight: 700; color: #0369a1; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; display: flex; align-items: center; gap: 5px; }
+.aibox-body { font-size: 10px; color: #0c4a6e; line-height: 1.6; }
+.ftxt { text-align: center; color: #94a3b8; font-size: 9px; letter-spacing: 0.4px; margin-top: 12px; padding-top: 8px; border-top: 1px solid #e2e8f0; }
+
+/* Simulation */
+.sim-topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    border-radius: 12px; padding: 14px 20px; margin-bottom: 14px;
+    border: 1px solid rgba(255,255,255,0.06); box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+}
+.sim-icon { width: 46px; height: 46px; border-radius: 10px; background: linear-gradient(135deg, #1e3a5f, #0369a1); display: flex; align-items: center; justify-content: center; font-size: 22px; border: 1px solid rgba(255,255,255,0.1); }
+.sim-title { color: #f8fafc; font-size: 17px; font-weight: 700; }
+.sim-sub { color: #64748b; font-size: 10px; margin-top: 3px; }
+.sim-notice { display: flex; align-items: center; gap: 10px; background:class="batch-card-wrap" rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 10px 16px; color: #94a3b8; font-size: 10px;min-height: 170px;display:flex;justify-content:space-between; align-items:center; }
+.sim-notice-title { color: #cbd5e1; font-weight: 600; font-size: 11px; margin-bottom: 2px; }
+.sim-group-hd { font-size: 9px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; margin: 14px 0 9px; display: flex; align-items: center; gap: 6px; padding: 5px 9px; border-radius: 6px; }
+.grp-env  { color: #0369a1; background: #f0f9ff; border: 1px solid #bae6fd; }
+.grp-qual { color: #15803d; background: #f0fdf4; border: 1px solid #bbf7d0; }
+.grp-dev  { color: #b45309; background: #fffbeb; border: 1px solid #fde68a; }
+
+/* Result cards */
+.result-card {
+    background:#ffffff;
+    border-radius:18px;
+    padding:22px 24px;
+    border:1px solid #e2e8f0;
+    height:100%;
+    box-shadow:0 4px 14px rgba(15,23,42,0.06);
+}
+.result-current {
+    background:#ffffff;
+    border:1px solid #fecaca;
+}
+
+.result-sim {
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    box-shadow: 0 4px 14px rgba(15,23,42,0.06);
+}
+.result-pending { background: linear-gradient(135deg, #f8fafc, #f1f5f9); border-color: #e2e8f0; }
+.result-card-hd { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; display: flex; align-items: center; gap: 6px; }
+.result-current {
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    box-shadow: 0 4px 14px rgba(15,23,42,0.06);
+}
+
+.result-sim {
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    box-shadow: 0 4px 14px rgba(15,23,42,0.06);
+}
+.result-pending {
+    background:#ffffff;
+    border:1px solid #e2e8f0;
+}
+.result-card-hd-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.result-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid rgba(0,0,0,0.04); }
+.result-row:last-child { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
+.result-lbl { font-size: 10px; color: #64748b; font-weight: 500; }
+.result-val { font-family: 'IBM Plex Mono', monospace; font-size: 20px; font-weight: 700; }
+.result-val-red   { color: #dc2626; }
+.result-val-green { color: #16a34a; }
+.result-val-dark  { color: #0f172a; }
+.result-val-muted { color: #94a3b8; }
+.decision-badge-lg { display: inline-block; padding: 4px 14px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; }
+.risk-badge-sm { display: inline-block; padding: 3px 11px; border-radius: 20px; font-size: 10px; font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; }
+.delta-pill { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 20px; font-size: 10px; font-weight: 700; font-family: 'IBM Plex Mono', monospace; }
+.delta-good    { background: #dcfce7; color: #15803d; border: 1px solid #bbf7d0; }
+.delta-bad     { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+.delta-neutral { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
+.outcome-banner { border-radius: 10px; padding: 14px 18px; margin-top: 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid; }
+.outcome-good { background: linear-gradient(135deg,#f0fdf4,#dcfce7); border-color: #86efac; }
+.outcome-warn { background: linear-gradient(135deg,#fffbeb,#fef3c7); border-color: #fde68a; }
+.outcome-bad  { background: linear-gradient(135deg,#fff5f5,#fee2e2); border-color: #fca5a5; }
+.outcome-text { font-size: 12px; font-weight: 700; }
+.outcome-sub  { font-size: 10px; margin-top: 3px; opacity: 0.8; }
+.outcome-good .outcome-text { color: #15803d; }
+.outcome-good .outcome-sub  { color: #16a34a; }
+.outcome-warn .outcome-text { color: #92400e; }
+.outcome-bad  .outcome-text { color: #b91c1c; }
+.ml-pred-card { margin-top: 12px; padding: 14px 16px; border-radius: 10px; background: linear-gradient(135deg, #eef2ff, #e0e7ff); border: 1px solid #c7d2fe; }
+.ml-pred-hd { font-size: 9px; font-weight: 700; color: #4338ca; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+.ml-pred-row { display: flex; align-items: center; justify-content: space-between; }
+.ml-pred-val { font-family: 'IBM Plex Mono', monospace; font-size: 28px; font-weight: 700; }
+.ml-pred-sub { font-size: 10px; color: #4f46e5; margin-top: 3px; }
+.tip-bar { background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 9px 14px; margin-top: 12px; font-size: 10px; color: #78350f; display: flex; align-items: center; gap: 8px; }
+.sterility-warn { background: #fef2f2; border: 1px solid #fecaca; border-left: 3px solid #dc2626; border-radius: 8px; padding: 11px 14px; margin-bottom: 12px; font-size: 11px; color: #b91c1c; font-weight: 600; display: flex; align-items: center; gap: 9px; }
+.filter-label { font-size: 10px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 7px; }
+.ai-rec-box { background: linear-gradient(135deg, #f0f9ff, #e0f2fe); border: 1px solid #bae6fd; border-left: 3px solid #0284c7; border-radius: 9px; padding: 13px 16px; margin-top: 14px; }
+.ai-rec-hd { font-size: 10px; font-weight: 700; color: #0369a1; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+.ai-rec-item { font-size: 10px; color: #0c4a6e; margin-bottom: 5px; display: flex; align-items: flex-start; gap: 8px; line-height: 1.55; }
+.ai-rec-dot { width: 5px; height: 5px; border-radius: 50%; background: #0284c7; flex-shrink: 0; margin-top: 4px; }
+.pending-note { font-size: 9px; color: #94a3b8; margin-bottom: 10px; padding: 5px 10px; background: #f8fafc; border-radius: 6px; border: 1px dashed #e2e8f0; text-align: center; }
+.sim-fin-delta { display: flex; gap: 8px; margin-top: 12px; }
+.sim-fin-box { flex: 1; border-radius: 8px; padding: 10px 12px; text-align: center; border: 1px solid; }
+.sim-fin-lbl { font-size: 8px; color: #64748b; text-transform: uppercase; letter-spacing: 0.3px; margin-bottom: 4px; }
+.sim-fin-val { font-family: 'IBM Plex Mono', monospace; font-size: 14px; font-weight: 700; }
+</style>
+"""
+st.markdown(SHARED_CSS, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LANDING PAGE
+# ─────────────────────────────────────────────────────────────────────────────
+LANDING_CSS = """
+<style>
+[data-testid="stAppViewContainer"], [data-testid="stApp"], section.main, .main .block-container {
+    background-color: #D9E3FB !important;
+}
+[data-testid="stHeader"] { background-color: #D9E3FB !important; }
+.lp-brand-name span { color: #3b82f6; }
+.lp-brand-sub { font-size: 10px; color: #94a3b8; font-weight: 500; letter-spacing: 0.3px; }
+.lp-nav-chip { display: flex; align-items: center; gap: 7px; padding: 7px 14px; border-radius: 8px; background: #f8fafc; border: 1px solid #e2e8f0; font-size: 11px; font-weight: 600; color: #475569; }
+.lp-live-badge { display: flex; align-items: center; gap: 7px; padding: 7px 14px; border-radius: 8px; background: #f0fdf4; border: 1px solid #bbf7d0; font-size: 11px; font-weight: 700; color: #15803d; }
+.lp-live-dot { width: 8px; height: 8px; background: #22c55e; border-radius: 50%; display: inline-block; box-shadow: 0 0 6px rgba(34,197,94,0.7); animation: lp-blink 2s infinite; }
+@keyframes lp-blink { 0%,100%{opacity:1} 50%{opacity:.25} }
+.lp-ai-tag { display: inline-flex; align-items: center; gap: 7px; padding: 6px 14px; background: linear-gradient(135deg,#eff6ff,#dbeafe); border: 1px solid #bfdbfe; border-radius: 20px; font-size: 10px; font-weight: 700; color: #1d4ed8; letter-spacing: 0.8px; text-transform: uppercase; margin-bottom: 22px; }
+.lp-ai-tag-dot { width: 6px; height: 6px; background: #3b82f6; border-radius: 50%; animation: lp-blink 1.8s infinite; }
+.lp-hero-h1 { font-size: 40px; font-weight: 700; line-height: 1.18; color: #0f172a; letter-spacing: -0.5px; margin-bottom: 8px; }
+.lp-hero-h1-accent { color: #3b82f6; }
+.lp-hero-sub { font-size: 15px; color: #64748b; line-height: 1.65; max-width: 480px; margin-bottom: 34px; font-weight: 400; }
+div[data-testid="stButton"] > button[kind="primary"] {
+    background: linear-gradient(135deg,#3b82f6,#1d4ed8) !important; color: white !important; border: none !important;
+    border-radius: 10px !important; font-size: 15px !important; font-weight: 700 !important; width: 320px !important;
+    box-shadow: 0 4px 18px rgba(59,130,246,0.4) !important;
+}
+</style>
+"""
+
+
+def show_landing_page():
+    st.markdown(LANDING_CSS, unsafe_allow_html=True)
+
+    col_logo, col_chips = st.columns([1, 2], gap="small")
+    with col_logo:
+        st.markdown("""
+        <div style="display:flex;align-items:center;gap:12px;padding:10px 0;">
+          <div style="width:38px;height:38px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 3px 10px rgba(59,130,246,0.35);">⚗️</div>
+          <div>
+            <div style="font-size:16px;font-weight:700;color:#0f172a;">PHARMA <span style="color:#3b82f6;">COPILOT</span></div>
+            <div class="lp-brand-sub">Batch Release Intelligence</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_chips:
+        st.markdown("""
+        <div style="display:flex;align-items:center;justify-content:flex-end;gap:10px;padding:14px 0;">
+          <div class="lp-nav-chip">🛡️ &nbsp;FDA 21 CFR Part 11 Compliant</div>
+          <div class="lp-nav-chip">🔒 &nbsp;Secure &amp; Trusted</div>
+          <div class="lp-live-badge"><span class="lp-live-dot"></span>LIVE</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<hr style='border:none;border-top:1px solid #e2e8f0;margin:0 0 24px 0;'>", unsafe_allow_html=True)
+
+    hero_left, hero_right = st.columns([1.2, 0.8], gap="small")
+    with hero_left:
+        st.markdown("""
+        <div style="padding:20px 0 0 40px;">
+          <div class="lp-ai-tag"><span class="lp-ai-tag-dot"></span>AI-POWERED QUALITY INTELLIGENCE</div>
+          <div class="lp-hero-h1" style="margin-top:12px;">
+            Real-Time Batch Release Intelligence
+            <span class="lp-hero-h1-accent"><br>&amp; FDA Compliance Copilot</span>
+          </div>
+          <div class="lp-hero-sub" style="margin-top:12px;">
+            Proactively detect risks, predict batch failures, and accelerate
+            confident release decisions with AI-driven Gold layer intelligence.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("<div style='display:flex;justify-content:flex-start;padding-left:120px;margin-top:10px;'>", unsafe_allow_html=True)
+        if st.button("🚀  Launch Intelligence Platform", type="primary", key="lp_cta"):
+            st.session_state.page = "dashboard"
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with hero_right:
+        img_bytes = load_static_image_bytes("stagesvg.png")
+        if img_bytes:
+            st.markdown("<div style='display:flex;justify-content:center;padding-top:20px;'>", unsafe_allow_html=True)
+            st.image(io.BytesIO(img_bytes), width=460)
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("<div style='text-align:center;padding-top:60px;font-size:80px;'>??</div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+
+    fc1, fc2, fc3 = st.columns(3, gap="small")
+    feature_cards = [
+        (fc1, "⏱️", "#eff6ff", "Faster Decisions", "Reduce batch release time by up to 50%"),
+        (fc2, "🛡️", "#f0fdf4", "Lower Risks",      "Minimize batch rejection and quality risks"),
+        (fc3, "📄", "#f5f3ff", "Audit Ready",       "Automated compliance with FDA 21 CFR Part 11"),
+    ]
+    for col, icon, bg, title, desc in feature_cards:
+        with col:
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px 22px;box-shadow:0 2px 10px rgba(0,0,0,0.05);display:flex;align-items:flex-start;gap:14px;">
+              <div style="width:44px;height:44px;background:{bg};border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">{icon}</div>
+              <div>
+                <div style="font-size:13px;font-weight:700;color:#0f172a;margin-bottom:4px;">{title}</div>
+                <div style="font-size:11px;color:#64748b;line-height:1.55;">{desc}</div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+    st.markdown("""
+    <div style="text-align:center;padding:16px 0 20px;font-size:11px;color:#94a3b8;border-top:1px solid #f1f5f9;letter-spacing:0.3px;">
+      Trusted by Quality Leaders. Built for Life Sciences. &nbsp;·&nbsp;
+      Powered by <span style="color:#3b82f6;font-weight:600;">Snowflake Gold Layer + XGBoost ML</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DASHBOARD PAGE
+# ─────────────────────────────────────────────────────────────────────────────
+def show_dashboard():
+    # ── Tabler icons (paste here, first line) ──────────────
+    st.markdown("""
+    <link rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="topbar">'
+        '  <div class="topbar-left">'
+        '    <div class="topbar-icon">⚗️</div>'
+        '    <div>'
+        '      <div class="topbar-title">PHARMA BATCH RELEASE INTELLIGENCE</div>'
+        '      <div class="topbar-sub">Gold Layer · AI-Powered Quality Intelligence · FDA Audit-Ready</div>'
+        '    </div>'
+        '  </div>'
+        '  <div class="topbar-right">'
+        '    <span class="pill pill-live"><span class="live-dot"></span>LIVE</span>'
+        '    <span class="pill pill-fda">FDA Audit Ready</span>'
+        '  </div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    
+
+    top_btn_col = st.columns([6, 1])
+    with top_btn_col[1]:
+        if st.button("🔬 Simulation Lab", key="open_sim_top", type="primary"):
+            st.session_state.sim_batch_id = None
+            st.session_state.page = "simulation"
+            st.rerun()
+
+    # ── KPI STRIP (from Gold VW_UI_KPI) ──────────────────────────────────
+    kpi_df  = load_kpi()
+    kpi     = kpi_df.iloc[0] if not kpi_df.empty else {}
+
+    kpi_meta = [
+        ("Total Batches",  "TOTAL_BATCHES",  "kc0", "All cycles"),
+        ("Release Ready",  "RELEASE_READY",  "kc1", "Passed QA"),
+        ("Rejected",       "REJECTED",       "kc2", "Failed QA"),
+        ("Total Revenue",  "TOTAL_REVENUE",  "kc3", "Committed"),
+        ("Total Penalty",  "TOTAL_PENALTY",  "kc4", "Applied"),
+    ]
+    kpi_parts = ['<div class="kpi-strip">']
+    for lbl, field, cls, sub in kpi_meta:
+        raw = kpi.get(field, 0) if hasattr(kpi, "get") else kpi[field] if field in kpi else 0
+        if field in ("TOTAL_REVENUE", "TOTAL_PENALTY"):
+            val = fmt_currency(raw)
+        else:
+            try:
+                val = f"{int(raw):,}"
+            except Exception:
+                val = "—"
+        kpi_parts.append(
+            f'<div class="kpi-card {cls}">'
+            f'<div class="kpi-lbl">{lbl}</div>'
+            f'<div class="kpi-val">{val}</div>'
+            f'<div class="kpi-sub">{sub}</div>'
+            f'</div>'
+        )
+    kpi_parts.append('</div>')
+    st.markdown("".join(kpi_parts), unsafe_allow_html=True)
+
+    # ── FILTERS ───────────────────────────────────────────────────────────
+    batch_df = load_batch_list()
+
+    fc1, fc2, fc3 = st.columns([2.2, 1.3, 2], gap="small")
+    with fc1:
+        st.markdown('<div class="filter-label">Filter by Decision</div>', unsafe_allow_html=True)
+        filter_cols = st.columns(5)
+        for i, f in enumerate(["All", "Release", "Retest", "Hold", "Reject"]):
+            with filter_cols[i]:
+                if st.button(f, use_container_width=True, key=f"filt_{f}"):
+                    st.session_state.filter_opt = f
+
+    filtered = batch_df.copy()
+    if st.session_state.filter_opt != "All":
+        filtered = filtered[filtered["FINAL_DECISION"] == st.session_state.filter_opt.upper()]
+
+    with fc2:
+        st.markdown('<div class="filter-label">Product Type</div>', unsafe_allow_html=True)
+        prod_opts = ["All"] + sorted(batch_df["PRODUCT_TYPE"].dropna().unique().tolist())
+        sel_prod  = st.selectbox("", prod_opts, key="prod_sel")
+        if sel_prod != "All":
+            filtered = filtered[filtered["PRODUCT_TYPE"] == sel_prod]
+
+    with fc3:
+        st.markdown('<div class="filter-label">Select Batch (sorted by risk)</div>', unsafe_allow_html=True)
+        batch_ids = filtered["BATCH_ID"].tolist()
+        sel_batch = st.selectbox("", batch_ids, key="batch_sel") if batch_ids else None
+
+    # ── HERO BANNER ───────────────────────────────────────────────────────
+    if sel_batch:
+        row = filtered[filtered["BATCH_ID"] == sel_batch]
+        if not row.empty:
+            r        = row.iloc[0]
+            fp_pct   = pct_int(r.get("FAILURE_PROBABILITY", 0))
+            decision = safe(r.get("FINAL_DECISION"), "HOLD").upper()
+            prod_nm  = safe(r.get("PRODUCT_NAME") or r.get("PRODUCT_TYPE"))
+            dosage   = safe(r.get("DOSAGE_FORM"))
+            override = safe(r.get("RULE_OVERRIDE_REASON"))
+            fp_clr   = fp_color(fp_pct)
+            fp_bg    = "#fee2e2" if fp_pct >= 65 else "#fef3c7" if fp_pct >= 35 else "#dcfce7"
+            fp_tag_c = "#b91c1c" if fp_pct >= 65 else "#b45309" if fp_pct >= 35 else "#15803d"
+            tag_lbl  = "HIGH RISK" if fp_pct >= 65 else "MONITOR" if fp_pct >= 35 else "ON TRACK"
+            dec_cls  = {
+                "RELEASE": "b-release", "REJECT": "b-reject",
+                "HOLD": "b-hold", "RETEST": "b-retest"
+            }.get(decision, "b-hold")
+            override_html = (
+                f'<div class="override-tag">⚖️ Rule Override: {override}</div>'
+                if override and override != "—" else ""
+            )
+           # ── ring gauge calculation ────────────────────────────
+            CIRCUMFERENCE = 188.5          # 2 * pi * 30
+            ring_offset   = CIRCUMFERENCE * (1 - fp_pct / 100)
+            
+            # ring color based on failure probability
+            if fp_pct >= 65:
+                ring_color  = "#e24b4a"
+                inner_color = "#b91c1c"
+            elif fp_pct >= 35:
+                ring_color  = "#ef9f27"
+                inner_color = "#b45309"
+            else:
+                ring_color  = "#22c55e"
+                inner_color = "#16a34a"
+            
+            override_html = (
+                f'<div class="hero-risk-pill" style="margin-bottom:8px;">⚖️ Rule Override: {override}</div>'
+                if override and override != "—" else ""
+            )
+            # ── dosage form icon mapping ──────────────────────────
+            dosage_form = safe(r.get("DOSAGE_FORM"), "Solid Oral")
+            dosage_icon_map = {
+                "Solid Oral":  ("ti-pill",     "#1d9e75", "#e1f5ee"),
+                "Tablet":      ("ti-pill",     "#1d9e75", "#e1f5ee"),
+                "Capsule":     ("ti-pill",     "#1d9e75", "#e1f5ee"),
+                "Injection":   ("ti-droplet",  "#378add", "#e6f1fb"),
+                "Syrup":       ("ti-bottle",   "#7f77dd", "#eeedfe"),
+                "Suspension":  ("ti-bottle",   "#7f77dd", "#eeedfe"),
+                "Topical":     ("ti-spray",    "#1d9e75", "#e1f5ee"),
+                "Inhaler":     ("ti-wind",     "#378add", "#e6f1fb"),
+                "Ointment":    ("ti-droplet-half", "#7f77dd", "#eeedfe"),
+            }
+            d_icon, d_color, d_bg = dosage_icon_map.get(dosage_form, ("ti-pill", "#1d9e75", "#e1f5ee"))
+                        
+            st.markdown(
+                f'<div class="hero-banner">'
+            
+                # accent bar
+                f'  <div class="hero-accent-bar" style="background:{ring_color};"></div>'
+            
+                f'  <div class="hero-body">'
+            
+                # ── LEFT ──────────────────────────────────────────────
+                f'    <div class="hero-left">'
+                f'      {override_html}'
+                f'      <div class="hero-batch-id">{sel_batch}</div>'
+                f'      <div class="hero-product">{prod_nm}</div>'
+                f'      <div class="hero-risk-pill">'
+                f'        <i class="ti ti-alert-triangle"></i>'
+                f'        {safe(r.get("TOP_RISK_FACTOR_1"), "Process Risk")}'
+                f'      </div>'
+                f'    </div>'
+            
+                f'    <div class="hero-divider"></div>'
+            
+                # ── CARDS ─────────────────────────────────────────────
+                f'    <div class="hero-cards-wrap">'
+            
+                # Plant
+                f'      <div class="hero-mini-card card-plant">'
+                f'        <div class="hero-card-icon-row">'
+                f'          <div class="hero-card-icon" style="background:#eeedfe;">'
+                f'            <i class="ti ti-building-factory-2" style="color:#7f77dd;"></i>'
+                f'          </div>'
+                f'          <span class="hero-mini-label">Plant</span>'
+                f'        </div>'
+                f'        <div class="hero-mini-value">{safe(r.get("PLANT_ID"), "PLANT_01")}</div>'
+                f'      </div>'
+            
+                # Type (dynamic icon)
+                f'      <div class="hero-mini-card card-type">'
+                f'        <div class="hero-card-icon-row">'
+                f'          <div class="hero-card-icon" style="background:{d_bg};">'
+                f'            <i class="ti {d_icon}" style="color:{d_color};"></i>'
+                f'          </div>'
+                f'          <span class="hero-mini-label">Type</span>'
+                f'        </div>'
+                f'        <div class="hero-mini-value">{dosage_form}</div>'
+                f'      </div>'
+            
+                # Mfg Date
+                f'      <div class="hero-mini-card card-date">'
+                f'        <div class="hero-card-icon-row">'
+                f'          <div class="hero-card-icon" style="background:#e6f1fb;">'
+                f'            <i class="ti ti-calendar" style="color:#378add;"></i>'
+                f'          </div>'
+                f'          <span class="hero-mini-label">Mfg Date</span>'
+                f'        </div>'
+                f'        <div class="hero-mini-value">{safe(str(r.get("BATCH_DATE"))[:10])}</div>'
+                f'      </div>'
+            
+                # Revenue at Risk
+                f'      <div class="hero-mini-card card-rev">'
+                f'        <div class="hero-card-icon-row">'
+                f'          <div class="hero-card-icon" style="background:#faeeda;">'
+                f'            <i class="ti ti-currency-dollar" style="color:#ef9f27;"></i>'
+                f'          </div>'
+                f'          <span class="hero-mini-label" style="color:#92400e;">Revenue at Risk</span>'
+                f'        </div>'
+                f'        <div class="hero-mini-value" style="color:#78350f;">'
+                f'          {fmt_currency(r.get("TOTAL_COMMITTED_REVENUE", 0))}'
+                f'        </div>'
+                f'      </div>'
+            
+                f'    </div>'
+            
+                f'    <div class="hero-divider"></div>'
+            
+                # ── RIGHT: ring + badge ────────────────────────────────
+                f'    <div class="hero-right">'
+                f'      <div class="hero-fp-label">Failure Probability</div>'
+            
+                f'      <div class="hero-fp-ring">'
+                f'        <svg width="72" height="72" viewBox="0 0 72 72" style="transform:rotate(-90deg);">'
+                f'          <circle cx="36" cy="36" r="30" fill="none" stroke="#f1f5f9" stroke-width="5"/>'
+                f'          <circle cx="36" cy="36" r="30" fill="none"'
+                f'            stroke="{ring_color}" stroke-width="5"'
+                f'            stroke-dasharray="{CIRCUMFERENCE}"'
+                f'            stroke-dashoffset="{ring_offset:.1f}"'
+                f'            stroke-linecap="round"/>'
+                f'        </svg>'
+                f'        <div class="hero-fp-inner" style="color:{inner_color};">{fp_pct}%</div>'
+                f'      </div>'
+            
+                f'      <span class="badge {dec_cls}">{decision}</span>'
+                f'    </div>'
+            
+                f'  </div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    # ── MAIN PANEL ────────────────────────────────────────────────────────
+    left, right = st.columns([1, 2.1], gap="small")
+
+    with left:
+        items_html = ""
+        for _, row in filtered.head(100).iterrows():
+            bid      = safe(row.get("BATCH_ID"))
+            decision = safe(row.get("FINAL_DECISION"), "HOLD").upper()
+            name     = safe(row.get("PRODUCT_NAME") or row.get("PRODUCT_TYPE"))
+            dosage   = safe(row.get("DOSAGE_FORM"))
+            date_val = safe(str(row.get("BATCH_DATE", ""))[:10])
+            fp_raw   = row.get("FAILURE_PROBABILITY", 0)
+            fp_p     = pct_int(fp_raw)
+            fp_str   = f"{fp_p}%"
+            fp_clr_i = fp_color(fp_p)
+            sel_cls  = "bitem-sel" if bid == sel_batch else ""
+            items_html += (
+                f'<div class="bitem {sel_cls}">'
+                f'  <div class="bitem-top">'
+                f'    <div><span class="bid">{bid}</span>'
+                f'    <span class="bname">{name[:18]}{"…" if len(name)>18 else ""}</span></div>'
+                + badge_html(decision) +
+                f'  </div>'
+                f'  <div class="bmeta">{dosage} · {date_val}'
+                f'    <span style="color:{fp_clr_i};font-weight:700;font-family:IBM Plex Mono,monospace;"> · {fp_str}</span>'
+                f'  </div>'
+                f'</div>'
+            )
+        st.markdown(
+            f'<div class="panel">'
+            f'<div class="panel-hd"><span>Batch Queue (Risk Sorted)</span>'
+            f'<span class="panel-hd-count">{len(filtered)}</span></div>'
+            f'<div class="bscroll">{items_html}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    with right:
+        if not sel_batch:
+            st.markdown(
+                '<div class="dpanel" style="min-height:300px;display:flex;align-items:center;'
+                'justify-content:center;flex-direction:column;gap:10px;">'
+                '<span style="font-size:28px;">⚗️</span>'
+                '<span style="color:#94a3b8;font-size:12px;font-weight:500;">Select a batch from the queue</span>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            df = load_batch_detail(sel_batch)
+            if df.empty:
+                st.markdown('<div class="dpanel" style="padding:20px;color:#94a3b8;">No data found for: ' + sel_batch + '</div>', unsafe_allow_html=True)
+            else:
+                d = df.iloc[0]
+                rel_score  = float(d.get("RELEASE_SCORE",            0) or 0)
+                fail_prob  = float(d.get("FAILURE_PROBABILITY",      0) or 0)
+                crit_dev   = int(  d.get("CRITICAL_DEVIATION_COUNT", 0) or 0)
+                high_dev   = int(  d.get("HIGH_DEVIATION_COUNT",     0) or 0)
+                total_dev  = int(  d.get("TOTAL_DEVIATIONS",         0) or 0)
+                other_dev  = max(total_dev - crit_dev - high_dev, 0)
+                rf1        = safe(d.get("TOP_RISK_FACTOR_1"))
+                rf2        = safe(d.get("TOP_RISK_FACTOR_2"))
+                rf3        = safe(d.get("TOP_RISK_FACTOR_3"))
+                ai_text    = safe(d.get("AI_DECISION_REASON"), "No AI assessment available.")
+                decision   = safe(d.get("FINAL_DECISION"), "HOLD").upper()
+                dev1_name  = safe(d.get("DEVIATION_1_NAME"), "High Yield Deviation")
+                dev2_name  = safe(d.get("DEVIATION_2_NAME"), "Human - Label mix-up")
+                dev3_name  = safe(d.get("DEVIATION_3_NAME"), "Equipment Recalibrated")
+                score_pct  = pct_int(rel_score)
+                fp_pct     = pct_int(fail_prob)
+                score_color = "#16a34a" if score_pct >= 70 else "#d97706" if score_pct >= 40 else "#dc2626"
+                # fp_color    = "#dc2626" if fp_pct    >= 65 else "#d97706" if fp_pct    >= 35 else "#16a34a"
+                conic_bg    = "conic-gradient(" + score_color + " " + str(score_pct) + "%, #f1f5f9 0)"
+                if fp_pct >= 65 or crit_dev >= 3:
+                    risk_cls, risk_lbl = "r-high",   "HIGH RISK"
+                elif fp_pct >= 35 or crit_dev >= 1:
+                    risk_cls, risk_lbl = "r-medium", "MEDIUM RISK"
+                else:
+                    risk_cls, risk_lbl = "r-low",    "LOW RISK"
+                bw_crit  = str(bar_w(crit_dev,  total_dev))
+                bw_high  = str(bar_w(high_dev,  total_dev))
+                bw_other = str(bar_w(other_dev, total_dev))
+                temp_viol = int(d.get("TEMP_VIOLATION_COUNT", crit_dev) or crit_dev)
+                ph_border = int(d.get("PH_BORDERLINE_COUNT",  high_dev) or high_dev)
+                ph_base   = int(d.get("PH_BASELINE_COUNT",    max(other_dev // 2, 1)) or 1)
+                baseline  = int(d.get("BASELINE_COUNT",        max(other_dev - ph_base, 1)) or 1)
+                donut_segments = [
+                    (max(temp_viol, 1), "#ef4444", "Temp Violations"),
+                    (max(ph_border, 1), "#f97316", "pH Borderline"),
+                    (max(ph_base,   1), "#eab308", "pH Baseline"),
+                    (max(baseline,  1), "#22c55e", "Baseline"),
+                ]
+                donut_svg_str = donut_svg(donut_segments, size=109)
+                donut_colors  = ["#ef4444","#f97316","#eab308","#22c55e"]
+                donut_labels  = ["Temp Violations","pH Borderline","pH Baseline","Baseline"]
+                legend_html   = "".join([
+                    '<div class="legend-item"><div class="legend-dot" style="background:' + col + ';"></div>' + lbl + '</div>'
+                    for col, lbl in zip(donut_colors, donut_labels)
+                ])
+                dev_rows = [
+                    (dev1_name, "Yield Deviation", "dev-yield"),
+                    (dev2_name, "Critical",         "dev-crit"),
+                    (dev3_name, "Equipment",        "dev-equip"),
+                ]
+                dev_rows_html = "".join([
+                    '<tr><td>' + row[0] + '</td><td><span class="dev-badge ' + row[2] + '">' + row[1] + '</span></td></tr>'
+                    for row in dev_rows
+                ])
+                # ── Financial helper ──────────────────────────────
+                def fmt_money(val):
+                    try:
+                        v = float(val or 0)
+                        if v >= 1e9: return f"$ {v/1e9:.2f}B"
+                        if v >= 1e6: return f"$ {v/1e6:.1f}M"
+                        if v >= 1e3: return f"$ {v/1e3:.1f}K"
+                        return f"$ {v:,.0f}"
+                    except: return "$ 0"
+
+                rev_val      = fmt_money(d.get("TOTAL_COMMITTED_REVENUE", 0))
+                mat_val      = fmt_money(d.get("TOTAL_MATERIAL_COST", 0))
+                pen_val      = fmt_money(d.get("TOTAL_PENALTY_EXPOSURE", 0))
+                ovr_risk_raw = float(d.get("OVERALL_RISK_SCORE", 0) or 0)
+                ovr_risk_val = f"{ovr_risk_raw:.1%}"
+                pen_color    = "#dc2626" if float(d.get("TOTAL_PENALTY_EXPOSURE", 0) or 0) > 0 else "#16a34a"
+                ovr_color    = "#16a34a" if ovr_risk_raw <= 0.3 else "#d97706" if ovr_risk_raw <= 0.6 else "#dc2626"
+                fp_clr = fp_color(fp_pct)
+                detail_html = (
+                    '<div class="dpanel" style="height:auto;overflow:visible;">'
+
+                    # ── ROW 1: Score + Donut + Financial ──────────
+                    '<div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:14px;">'
+
+                    # Score circle
+                    # Score circle
+                    '<div style="flex-shrink:0;text-align:center;width:105px;">'
+                    '  <div style="width:103px;height:103px;border-radius:50%;background:' + conic_bg + ';'
+                    '       display:flex;align-items:center;justify-content:center;'
+                    '       box-shadow:0 3px 14px rgba(0,0,0,0.12);margin:0 auto;">'
+                    '    <div style="width:69px;height:69px;background:#fff;border-radius:50%;'
+                    '         display:flex;flex-direction:column;align-items:center;justify-content:center;">'
+                    '      <div style="font-family:IBM Plex Mono,monospace;font-size:22px;font-weight:700;color:#0f172a;line-height:1;">' + str(score_pct) + '</div>'
+                    '      <div style="font-size:8px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.3px;margin-top:2px;">Score</div>'
+                    '    </div>'
+                    '  </div>'
+                    '  <div style="font-size:9px;font-weight:700;color:#64748b;margin-top:6px;text-transform:uppercase;letter-spacing:0.4px;">Release Score</div>'
+                    '  <span class="rbadge ' + risk_cls + '" style="margin-top:5px;display:inline-flex;">' + risk_lbl + '</span>'
+                    '</div>'
+
+                    # Donut with legend below (original style)
+                '<div style="flex-shrink:0;text-align:center;width:111px;">'
+                + donut_svg_str +
+                '<div style="margin-top:6px;text-align:left;padding-left:14px;">'
+                + legend_html +
+                '</div>'
+                '</div>'
+
+                    # Financial Intelligence (fills empty space)
+                    '<div style="flex:1;min-width:0;">'
+                    '  <div style="font-size:9px;font-weight:700;color:#94a3b8;text-transform:uppercase;'
+                    '       letter-spacing:0.5px;margin-bottom:8px;">💹 Financial Impact</div>'
+                    '  <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">'
+
+                    '  <div class="mbox total-card" style="text-align:left;">'
+                    '    <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.3px;margin-bottom:3px;">💰 Revenue</div>'
+                    '    <div style="font-family:IBM Plex Mono,monospace;font-size:16px;font-weight:700;color:#0f172a;">' + rev_val + '</div>'
+                    '  </div>'
+
+                    '  <div class="mbox total-card" style="text-align:left;">'
+                    '    <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.3px;margin-bottom:3px;">📊 Material Cost</div>'
+                    '    <div style="font-family:IBM Plex Mono,monospace;font-size:16px;font-weight:700;color:#0f172a;">' + mat_val + '</div>'
+                    '  </div>'
+
+                    '  <div class="mbox total-card" style="text-align:left;">'
+                    '    <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.3px;margin-bottom:3px;">⚠️ Penalty</div>'
+                    '    <div style="font-family:IBM Plex Mono,monospace;font-size:16px;font-weight:700;color:' + pen_color + ';">' + pen_val + '</div>'
+                    '  </div>'
+
+                    '  <div class="mbox total-card" style="text-align:left;">'
+                    '    <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.3px;margin-bottom:3px;">📈 Overall Risk</div>'
+                    '    <div style="font-family:IBM Plex Mono,monospace;font-size:16px;font-weight:700;color:' + ovr_color + ';">' + ovr_risk_val + '</div>'
+                    '  </div>'
+
+                    '  </div>'  # end grid
+                    '</div>'    # end financial col
+                    '</div>'    # end ROW 1
+
+                   
+
+                    # ── ROW 1.5: Donut segment % breakdown cards ───
+                    + (lambda segs, total: (
+                        '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px;">'
+                        + "".join([
+                            f'<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:16px 14px;box-shadow:0 2px 10px rgba(15,23,42,0.05);'
+                            f'padding:8px 10px;text-align:center;">'
+                            f'<div style="width:8px;height:8px;border-radius:2px;background:{col};'
+                            f'margin:0 auto 4px auto;"></div>'
+                            f'<div style="font-family:IBM Plex Mono,monospace;font-size:13px;font-weight:700;'
+                            f'color:#0f172a;">{round(val/total*100)}%</div>'
+                            f'<div style="font-size:8px;color:#94a3b8;text-transform:uppercase;'
+                            f'letter-spacing:0.3px;margin-top:2px;">{lbl}</div>'
+                            f'</div>'
+                            for val, col, lbl in segs
+                        ])
+                        + '</div>'
+                    ))(
+                        [
+                            (max(temp_viol, 1), "#ef4444", "Temp Viol"),
+                            (max(ph_border, 1), "#f97316", "pH Border"),
+                            (max(ph_base,   1), "#eab308", "pH Base"),
+                            (max(baseline,  1), "#22c55e", "Baseline"),
+                        ],
+                        max(temp_viol + ph_border + ph_base + baseline, 1)
+                    ) +
+
+
+                    
+
+                    # ── ROW 2: Metrics strip ───────────────────────
+                    '<div class="mstrip">'
+                    '  <div class="mbox"><div class="mbox-val" style="color:#dc2626;">' + str(crit_dev) + '</div><div class="mbox-lbl">Critical Dev</div></div>'
+                    '  <div class="mbox"><div class="mbox-val" style="color:#d97706;">' + str(high_dev) + '</div><div class="mbox-lbl">High Dev</div></div>'
+                    '  <div class="mbox"><div class="mbox-val">' + str(total_dev) + '</div><div class="mbox-lbl">Total Dev</div></div>'
+                    '  <div class="mbox"><div class="mbox-val" style="color:' + fp_clr + ';">' + str(fp_pct) + '%</div><div class="mbox-lbl">Fail Prob</div></div>'
+                    '</div>'
+
+                    # ── ROW 3: AI Assessment ───────────────────────
+                    '<div class="hdiv"></div>'
+                    '<div class="aibox"><div class="aibox-hd">🤖 AI Copilot Assessment</div>'
+                    '<div class="aibox-body">' + ai_text + '</div></div>'
+                    '</div>'
+                )
+                st.markdown(detail_html, unsafe_allow_html=True)
+
+    # ─────────────────────────────────────────────
+
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('<div class="ftxt">Pharma Batch Release Intelligence · Snowflake Native · FDA Audit-Ready</div>', unsafe_allow_html=True)
+    render_chatbot(batch_context=sel_batch if sel_batch else None)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIMULATION LAB PAGE — REDESIGNED UI ONLY
+# All business logic, ML logic, Snowflake queries, UDF calls,
+# session state logic, and calculations are UNCHANGED.
+# Only CSS, HTML structure, Streamlit column layouts, and styling improved.
+# ─────────────────────────────────────────────────────────────────────────────
+def show_simulation_page():
+
+    # ── GLOBAL CSS ────────────────────────────────────────────────────────
+    st.markdown("""
+    <style>
+    /* ═══════════════════════════════════════════════════
+       DESIGN TOKENS
+    ═══════════════════════════════════════════════════ */
+    :root {
+        --bg-page:        #f4f6f9;
+        --bg-card:        #ffffff;
+        --bg-surface:     #f8fafc;
+        --border:         #e8ecf0;
+        --border-subtle:  #f1f5f9;
+
+        --blue:           #2563eb;
+        --blue-light:     #eff6ff;
+        --blue-mid:       #bfdbfe;
+
+        --green:          #16a34a;
+        --green-light:    #f0fdf4;
+        --green-mid:      #bbf7d0;
+
+        --amber:          #d97706;
+        --amber-light:    #fffbeb;
+        --amber-mid:      #fde68a;
+
+        --red:            #dc2626;
+        --red-light:      #fef2f2;
+        --red-mid:        #fecaca;
+
+        --gray-50:        #f8fafc;
+        --gray-100:       #f1f5f9;
+        --gray-200:       #e2e8f0;
+        --gray-400:       #94a3b8;
+        --gray-500:       #64748b;
+        --gray-700:       #374151;
+        --gray-900:       #0f172a;
+
+        --radius-sm:      10px;
+        --radius-md:      14px;
+        --radius-lg:      18px;
+        --radius-xl:      22px;
+
+        --shadow-sm:      0 1px 4px rgba(15,23,42,0.04);
+        --shadow-md:      0 4px 16px rgba(15,23,42,0.07);
+        --shadow-lg:      0 8px 32px rgba(15,23,42,0.10);
+
+        --font-mono:      'IBM Plex Mono', 'JetBrains Mono', monospace;
+        --font-ui:        'Inter', 'DM Sans', system-ui, sans-serif;
+    }
+
+    /* Page background */
+    .stApp { background: var(--bg-page) !important; }
+
+    /* ═══════════════════════════════════════════════════
+       HERO TOPBAR
+    ═══════════════════════════════════════════════════ */
+    .hero-bar {
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 60%, #1d3a6b 100%);
+    
+    border-radius: var(--radius-xl);
+
+    padding: 10px 22px;
+
+    margin-bottom: 10px;
+
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    min-height: 92px;
+
+    box-shadow: var(--shadow-lg);
+
+    position: relative;
+    overflow: hidden;
+    }
+    .hero-bar::before {
+        content: '';
+        position: absolute;
+        top: -30px; right: -30px;
+        width: 120px; height: 120px;
+        background: radial-gradient(circle, rgba(37,99,235,0.25) 0%, transparent 70%);
+        border-radius: 50%;
+    }
+    .hero-left { display: flex; align-items: center; gap: 12px; }
+    .hero-icon {
+    width: 32px;
+    height: 32px;
+
+    background: rgba(37,99,235,0.18);
+
+    border: 1px solid rgba(37,99,235,0.35);
+
+    border-radius: 9px;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    font-size: 15px;
+
+    flex-shrink: 0;
+    }
+    .hero-title {
+    font-size: 13px;
+
+    font-weight: 800;
+
+    color: #ffffff;
+
+    letter-spacing: 0.2px;
+
+    font-family: var(--font-ui);
+
+    line-height: 1.2;
+  }
+    .hero-sub {
+    font-size: 9px;
+
+    color: rgba(255,255,255,0.45);
+
+    font-weight: 500;
+
+    margin-top: 1px;
+
+    line-height: 1.35;
+
+    font-family: var(--font-ui);
+  }
+    .hero-badge {
+    background: rgba(255,255,255,0.07);
+
+    border: 1px solid rgba(255,255,255,0.12);
+
+    border-radius: 10px;
+
+    padding: 5px 12px;
+
+    font-size: 8px;
+
+    font-weight: 700;
+
+    color: rgba(255,255,255,0.55);
+
+    letter-spacing: 0.6px;
+
+    text-transform: uppercase;
+
+    display: flex;
+    align-items: center;
+    gap: 6px;
+ }
+    .hero-badge-dot {
+        width: 6px; height: 6px; border-radius: 50%;
+        background: #22c55e;
+        box-shadow: 0 0 6px #22c55e;
+    }
+
+    /* ═══════════════════════════════════════════════════
+       BATCH SUMMARY BAR
+    ═══════════════════════════════════════════════════ */
+    .batch-bar {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        padding: 12px 18px;
+        margin-bottom: 14px;
+        display: flex;
+        align-items: center;
+        gap: 0;
+        box-shadow: var(--shadow-sm);
+    }
+    .batch-bar-seg {
+        flex: 1;
+        padding: 0 16px;
+        border-right: 1px solid var(--border-subtle);
+    }
+    .batch-bar-seg:first-child { padding-left: 0; }
+    .batch-bar-seg:last-child  { border-right: none; }
+    .batch-bar-lbl {
+        font-size: 9px; font-weight: 700; color: var(--gray-400);
+        text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px;
+        font-family: var(--font-ui);
+    }
+    .batch-bar-val {
+        font-size: 13px; font-weight: 700; color: var(--gray-900);
+        font-family: var(--font-mono);
+    }
+    .batch-bar-val-lg {
+        font-size: 22px; font-weight: 800; line-height: 1;
+        font-family: var(--font-mono);
+    }
+    .override-chip {
+        display: inline-block;
+        font-size: 9px; font-weight: 700;
+        color: #c2410c;
+        background: #fff7ed;
+        padding: 2px 8px; border-radius: 20px;
+        border: 1px solid #fed7aa;
+        margin-left: 6px;
+        vertical-align: middle;
+    }
+
+    /* ═══════════════════════════════════════════════════
+       STERILITY WARNING
+    ═══════════════════════════════════════════════════ */
+    .sterility-warn {
+        background: #fef2f2;
+        border: 1px solid #fecaca;
+        border-left: 3px solid #dc2626;
+        border-radius: var(--radius-sm);
+        padding: 8px 14px;
+        font-size: 10px; color: #991b1b; font-weight: 600;
+        margin-bottom: 12px;
+    }
+
+    /* ═══════════════════════════════════════════════════
+       INFO BANNER
+    ═══════════════════════════════════════════════════ */
+    .flow-banner {
+        background: var(--blue-light);
+        border: 1px solid var(--blue-mid);
+        border-radius: var(--radius-sm);
+        padding: 8px 14px;
+        font-size: 10px; color: #1d4ed8; font-weight: 500;
+        margin-bottom: 14px; line-height: 1.5;
+    }
+
+    /* ═══════════════════════════════════════════════════
+       SECTION HEADERS — INPUTS
+    ═══════════════════════════════════════════════════ */
+    .panel-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-xl);
+        padding: 18px 20px;
+        box-shadow: var(--shadow-sm);
+        margin-bottom: 12px;
+    }
+    .panel-card-hd {
+        font-size: 12px; font-weight: 800;
+        color: var(--gray-900);
+        letter-spacing: 0.2px;
+        margin-bottom: 4px;
+        font-family: var(--font-ui);
+    }
+    .panel-card-sub {
+        font-size: 10px; color: var(--gray-400);
+        font-weight: 500; margin-bottom: 16px;
+    }
+    .input-group-hd {
+        font-size: 9px; font-weight: 800;
+        text-transform: uppercase; letter-spacing: 0.7px;
+        padding: 5px 10px; border-radius: 7px;
+        margin: 14px 0 10px 0;
+        display: inline-block;
+    }
+    .grp-env  { background: #eff6ff; color: #1d4ed8; }
+    .grp-qual { background: #f0fdf4; color: #15803d; }
+    .grp-dev  { background: #fff7ed; color: #c2410c; }
+
+    /* Input overrides — compact premium feel */
+    div[data-testid="stNumberInput"] { margin-bottom: 10px !important; }
+    div[data-testid="stNumberInput"] label {
+        font-size: 10px !important; font-weight: 700 !important;
+        color: var(--gray-500) !important;
+        text-transform: uppercase !important; letter-spacing: 0.4px !important;
+        margin-bottom: 4px !important;
+    }
+    div[data-testid="stNumberInput"] input {
+        background: var(--gray-50) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 12px !important;
+        font-size: 13px !important; font-weight: 700 !important;
+        color: var(--gray-900) !important;
+        padding: 7px 12px !important;
+        height: 38px !important;
+        box-shadow: inset 0 1px 2px rgba(0,0,0,0.02) !important;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease !important;
+    }
+    div[data-testid="stNumberInput"] input:focus {
+        border-color: var(--blue) !important;
+        box-shadow: 0 0 0 3px rgba(37,99,235,0.10) !important;
+        background: #ffffff !important;
+    }
+    div[data-testid="stNumberInput"] button {
+        border: none !important;
+        background: var(--border) !important;
+        color: var(--gray-700) !important;
+        border-radius: 8px !important;
+        transition: all 0.15s ease !important;
+    }
+    div[data-testid="stNumberInput"] button:hover {
+        background: var(--blue-mid) !important; color: var(--blue) !important;
+    }
+
+    /* Selectbox styling */
+    div[data-testid="stSelectbox"] > div > div {
+        border-radius: 12px !important;
+        border: 1px solid var(--border) !important;
+        background: var(--gray-50) !important;
+        font-size: 13px !important;
+    }
+
+    /* Buttons */
+    
+    div[data-testid="stButton"] > button[kind="primary"] {
+        background: linear-gradient(135deg, #1d4ed8, #2563eb) !important;
+        border: none !important;
+        box-shadow: 0 2px 10px rgba(37,99,235,0.30) !important;
+    }
+    div[data-testid="stButton"] > button[kind="primary"]:hover {
+        box-shadow: 0 4px 18px rgba(37,99,235,0.40) !important;
+        transform: translateY(-1px) !important;
+    }
+    div[data-testid="stButton"] > button:not([kind="primary"]) {
+        background: var(--bg-surface) !important;
+        border: 1px solid var(--border) !important;
+        color: var(--gray-700) !important;
+    }
+    div[data-testid="stButton"] > button:not([kind="primary"]):hover {
+        background: var(--gray-100) !important;
+        border-color: var(--gray-400) !important;
+    }
+
+    /* ═══════════════════════════════════════════════════
+       COMPARISON PANEL
+    ═══════════════════════════════════════════════════ */
+    .cmp-panel {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-xl);
+        box-shadow: var(--shadow-md);
+        overflow: hidden;
+        margin-bottom: 12px;
+    }
+    .cmp-panel-hd {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 12px 18px;
+        border-bottom: 1px solid var(--border-subtle);
+        background: var(--gray-50);
+    }
+    .cmp-panel-hd-title {
+        font-size: 10px; font-weight: 800; color: var(--gray-700);
+        text-transform: uppercase; letter-spacing: 0.6px;
+        font-family: var(--font-ui);
+    }
+    .cmp-panel-hd-sub {
+        font-size: 9px; color: var(--gray-400); font-weight: 400;
+    }
+    .cmp-table { width: 100%; border-collapse: collapse; }
+    .cmp-table th {
+        font-size: 9px; font-weight: 800; color: var(--gray-400);
+        text-transform: uppercase; letter-spacing: 0.6px;
+        padding: 10px 18px 8px 18px;
+        text-align: left; border-bottom: 1px solid var(--border-subtle);
+    }
+    .cmp-table th:not(:first-child) { text-align: right; }
+    .cmp-table td {
+        padding: 9px 18px; font-size: 12px;
+        border-bottom: 1px solid var(--border-subtle);
+        vertical-align: middle;
+    }
+    .cmp-table tr:last-child td { border-bottom: none; }
+    .cmp-table tr:hover td { background: var(--gray-50); }
+    .cmp-row-lbl {
+        font-size: 10px; font-weight: 600; color: var(--gray-500);
+        font-family: var(--font-ui);
+    }
+    .cmp-val {
+        font-family: var(--font-mono); font-weight: 700;
+        color: var(--gray-900); font-size: 13px;
+        text-align: right;
+    }
+    .cmp-val-muted { color: var(--gray-400) !important; font-weight: 400 !important; }
+    .cmp-col-hd-current {
+        background: rgba(220,38,38,0.05);
+        color: #991b1b;
+    }
+    .cmp-col-hd-sim {
+        background: rgba(22,163,74,0.05);
+        color: #15803d;
+    }
+    .delta-pill {
+        display: inline-flex; align-items: center;
+        font-size: 9px; font-weight: 700;
+        padding: 2px 7px; border-radius: 20px;
+        font-family: var(--font-mono);
+        margin-left: 6px;
+    }
+    .delta-good { background: #dcfce7; color: #16a34a; }
+    .delta-bad  { background: #fee2e2; color: #dc2626; }
+    .delta-neutral { background: var(--gray-100); color: var(--gray-500); }
+
+    /* Decision badges */
+    .badge {
+        display: inline-block;
+        font-size: 9px; font-weight: 800;
+        padding: 3px 10px; border-radius: 20px;
+        letter-spacing: 0.4px; text-transform: uppercase;
+        font-family: var(--font-ui);
+    }
+    .badge-release { background: #dcfce7; color: #15803d; }
+    .badge-reject  { background: #fee2e2; color: #991b1b; }
+    .badge-hold    { background: #fef3c7; color: #92400e; }
+    .badge-retest  { background: #ede9fe; color: #5b21b6; }
+    .badge-pending { background: var(--gray-100); color: var(--gray-500); }
+
+    /* Risk badges */
+    .risk-badge {
+        display: inline-block;
+        font-size: 9px; font-weight: 800;
+        padding: 3px 10px; border-radius: 20px;
+        letter-spacing: 0.3px; font-family: var(--font-ui);
+    }
+    .risk-high   { background: #fee2e2; color: #dc2626; }
+    .risk-medium { background: #fef3c7; color: #d97706; }
+    .risk-low    { background: #dcfce7; color: #16a34a; }
+
+    /* ═══════════════════════════════════════════════════
+       ML PREDICTION CHIP
+    ═══════════════════════════════════════════════════ */
+    .ml-chip {
+        background: linear-gradient(135deg, #1e1b4b, #2e1065);
+        border-radius: var(--radius-md);
+        padding: 12px 16px;
+        display: flex; align-items: center; justify-content: space-between;
+        margin-bottom: 10px;
+    }
+    .ml-chip-left { display: flex; align-items: center; gap: 10px; }
+    .ml-chip-icon {
+        width: 32px; height: 32px;
+        background: rgba(139,92,246,0.25);
+        border-radius: 8px;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 16px; flex-shrink: 0;
+    }
+    .ml-chip-label {
+        font-size: 9px; font-weight: 700; color: rgba(255,255,255,0.45);
+        text-transform: uppercase; letter-spacing: 0.7px;
+    }
+    .ml-chip-val {
+        font-size: 22px; font-weight: 800; font-family: var(--font-mono);
+        line-height: 1;
+    }
+    .ml-chip-sub { font-size: 9px; color: rgba(255,255,255,0.40); margin-top: 2px; }
+    .ml-chip-tag {
+        background: rgba(139,92,246,0.25);
+        border: 1px solid rgba(139,92,246,0.4);
+        border-radius: 8px; padding: 4px 10px;
+        font-size: 9px; font-weight: 700;
+        color: #c4b5fd; letter-spacing: 0.5px;
+        text-transform: uppercase;
+    }
+
+    /* ═══════════════════════════════════════════════════
+       OUTCOME BANNER
+    ═══════════════════════════════════════════════════ */
+    .outcome-bar {
+        border-radius: var(--radius-sm);
+        padding: 10px 14px;
+        margin-top: 10px;
+        display: flex; align-items: center; gap: 10px;
+        font-size: 11px; font-weight: 600;
+    }
+    .outcome-good   { background: var(--green-light); color: #15803d; border: 1px solid var(--green-mid); }
+    .outcome-bad    { background: var(--red-light);   color: #991b1b; border: 1px solid var(--red-mid);   }
+    .outcome-warn   { background: var(--amber-light); color: #92400e; border: 1px solid var(--amber-mid); }
+    .outcome-change { background: var(--blue-light);  color: #1d4ed8; border: 1px solid var(--blue-mid);  }
+    .outcome-icon { font-size: 16px; flex-shrink: 0; }
+    .outcome-sub { font-size: 9px; font-weight: 500; opacity: 0.75; margin-top: 2px; }
+
+    /* ═══════════════════════════════════════════════════
+       FINANCIAL DELTA STRIP
+    ═══════════════════════════════════════════════════ */
+    .fin-strip {
+        display: grid; grid-template-columns: 1fr 1fr 1fr;
+        gap: 8px; margin-top: 10px;
+    }
+    .fin-strip-box {
+        border-radius: var(--radius-sm);
+        padding: 10px 12px;
+        border: 1px solid;
+    }
+    .fin-strip-lbl { font-size: 9px; font-weight: 700; color: var(--gray-400); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+    .fin-strip-val { font-family: var(--font-mono); font-size: 13px; font-weight: 800; }
+
+    /* ═══════════════════════════════════════════════════
+       CHARTS AREA
+    ═══════════════════════════════════════════════════ */
+  /* In the <style> block, update chart-card */
+    .chart-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 14px 16px;
+        box-shadow: var(--shadow-sm);
+        overflow: hidden;
+        height: auto;   /* ← change from 300px to auto */
+    }
+    .chart-card-hd {
+        font-size: 10px; font-weight: 800; color: var(--gray-500);
+        text-transform: uppercase; letter-spacing: 0.5px;
+        margin-bottom: 14px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid var(--border-subtle);
+    }
+    /* Reduce empty SVG spacing */
+    .chart-card svg {
+        width: 100% !important;
+        height: 260px !important;
+        display: block;
+        margin-top: -8px;
+    }
+    
+    /* Donut chart alignment */
+   .donut-flex {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    height: 235px;
+   }
+    
+   .donut-flex svg {
+    width: 150px !important;
+    height: 150px !important;
+   }
+    
+    /* Compact legend */
+    .donut-legend {
+        font-size: 11px;
+        line-height: 1.4;
+    }
+    
+    /* Reduce bottom spacing */
+    .ai-panel {
+        margin-top: 8px !important;
+    }
+    
+    /* Compact chart section spacing */
+    .chart-section {
+        margin-top: 6px;
+    }
+
+    /* ═══════════════════════════════════════════════════
+       AI RECOMMENDATIONS
+    ═══════════════════════════════════════════════════ */
+    .ai-panel {
+        background: linear-gradient(135deg, #eff6ff 0%, #f8fafc 100%);
+        border: 1px solid var(--blue-mid);
+        border-radius: var(--radius-lg);
+        padding: 16px 18px;
+        margin-top: 12px;
+    }
+    .ai-panel-hd {
+        font-size: 10px; font-weight: 800; color: #1d4ed8;
+        text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;
+    }
+    .ai-panel-sub {
+        font-size: 9px; color: #3b82f6; margin-bottom: 12px; font-weight: 500;
+    }
+    .ai-rec {
+        display: flex; align-items: flex-start; gap: 9px;
+        padding: 8px 0;
+        border-bottom: 1px solid rgba(37,99,235,0.08);
+        font-size: 11px; color: #1e3a8a; line-height: 1.5;
+    }
+    .ai-rec:last-child { border-bottom: none; padding-bottom: 0; }
+    .ai-rec-icon { flex-shrink: 0; font-size: 13px; margin-top: 1px; }
+
+    /* ═══════════════════════════════════════════════════
+       TIP BAR
+    ═══════════════════════════════════════════════════ */
+    .tip-bar {
+        background: var(--gray-50);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        padding: 9px 13px;
+        font-size: 10px; color: var(--gray-500);
+        margin-top: 10px; line-height: 1.5;
+    }
+
+    /* ═══════════════════════════════════════════════════
+       FOOTER
+    ═══════════════════════════════════════════════════ */
+    .page-footer {
+        text-align: center;
+        font-size: 9px; color: var(--gray-400);
+        padding: 16px 0 8px 0;
+        letter-spacing: 0.4px;
+    }
+
+    /* ═══════════════════════════════════════════════════
+       SUPPRESS STREAMLIT CHROME
+    ═══════════════════════════════════════════════════ */
+    #MainMenu, footer { visibility: hidden; }
+    .block-container { padding-top: 1rem !important; padding-bottom: 1rem !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ── HERO BAR ──────────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="hero-bar">'
+        '  <div class="hero-left">'
+        '    <div class="hero-icon">🧪</div>'
+        '    <div>'
+        '      <div class="hero-title">Batch Simulation Lab</div>'
+        '      <div class="hero-sub">XGBoost UDF → Gold decision logic → financial recalculation</div>'
+        '    </div>'
+        '  </div>'
+        '  <div class="hero-badge">'
+        '    <span class="hero-badge-dot"></span>'
+        '    In-memory · No Snowflake writes'
+        '  </div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ─────────────────────────────────────────────────────────────
+    # TOP ACTION BAR
+    # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # DASHBOARD BUTTON + BATCH DROPDOWN IN SAME ROW
+    # ─────────────────────────────────────────────────────────────
+    top_left, top_right = st.columns([0.18, 0.82], gap="small")
+    
+    with top_left:
+    
+        if st.button("← Dashboard", key="back_to_dash", use_container_width=True):
+            st.session_state.page = "dashboard"
+            st.rerun()
+    
+    with top_right:
+    
+        batch_df = load_batch_list()
+        all_batch_ids = (
+            batch_df["BATCH_ID"].dropna().tolist()
+            if not batch_df.empty and "BATCH_ID" in batch_df.columns
+            else []
+        )
+        default_idx = 0
+
+        if not all_batch_ids:
+            st.info("No batches available for simulation.")
+            st.session_state.sim_batch_id = None
+            st.session_state.last_ml_batch = None
+            return
+    
+        if (
+            st.session_state.sim_batch_id
+            and st.session_state.sim_batch_id in all_batch_ids
+        ):
+            default_idx = all_batch_ids.index(st.session_state.sim_batch_id)
+    
+        selected_bid = st.selectbox(
+            "",
+            all_batch_ids,
+            index=default_idx,
+            key="sim_batch_sel"
+        )
+
+    if not selected_bid:
+        st.info("No batches available for simulation.")
+        st.session_state.sim_batch_id = None
+        return
+   
+
+
+    # Reset state on batch change
+    if selected_bid != st.session_state.get("last_ml_batch"):
+        st.session_state.ml_pred        = None
+        st.session_state.simulated_data = None
+        st.session_state.last_ml_batch  = selected_bid
+        st.session_state.reset_counter  += 1
+
+    st.session_state.sim_batch_id = selected_bid
+
+    # ── Load from simulation base view (Gold layer) ───────────────────────
+    sim_base_df = load_simulation_base(selected_bid)
+    if sim_base_df.empty:
+        st.info("No batches available for simulation.")
+        return
+    sb = sim_base_df.iloc[0].to_dict()
+
+    # ── Extract original values — UNCHANGED ──────────────────────────────
+    orig = {
+        "product_type":              safe(sb.get("PRODUCT_TYPE"), "SOLID"),
+        "plant_id":                  safe(sb.get("PLANT_ID"), "PLANT_01"),
+        "batch_size":                float(sb.get("BATCH_SIZE", 5000) or 5000),
+        "batch_duration_hours":      float(sb.get("BATCH_DURATION_HOURS", 24) or 24),
+        "fail_prob":                 float(sb.get("ORIG_FAILURE_PROB", 0) or 0),
+        "rel_score":                 float(sb.get("ORIG_RELEASE_SCORE", 0) or 0),
+        "decision":                  safe(sb.get("ORIG_FINAL_DECISION"), "HOLD").upper(),
+        "ml_action":                 safe(sb.get("ORIG_ML_DECISION"), "HOLD").upper(),
+        "override_reason":           safe(sb.get("RULE_OVERRIDE_REASON")),
+        "temp_viol":                 int(sb.get("TEMP_VIOLATION_COUNT", 0) or 0),
+        "hum_viol":                  int(sb.get("HUMIDITY_VIOLATION_COUNT", 0) or 0),
+        "pres_viol":                 int(sb.get("PRESSURE_VIOLATION_COUNT", 0) or 0),
+        "failed_tests":              int(sb.get("FAILED_TEST_COUNT", 0) or 0),
+        "oos":                       int(sb.get("OOS_COUNT", 0) or 0),
+        "borderline":                int(sb.get("BORDERLINE_COUNT", 0) or 0),
+        "pass_rate":                 float(sb.get("FE_PASS_RATE_PCT", 95) or 95),
+        "crit_dev":                  int(sb.get("CRITICAL_DEVIATION_COUNT", 0) or 0),
+        "high_dev":                  int(sb.get("HIGH_DEVIATION_COUNT", 0) or 0),
+        "proc_var":                  float(sb.get("PROCESS_VARIANCE", 0.1) or 0.1),
+        "total_tests":               int(sb.get("TOTAL_TESTS", 20) or 20),
+        "sterility_fail_flag":       int(sb.get("STERILITY_FAIL_FLAG", 0) or 0),
+        "endotoxin_fail_flag":       int(sb.get("ENDOTOXIN_FAIL_FLAG", 0) or 0),
+        "sterility_x_endotoxin":     int((sb.get("STERILITY_FAIL_FLAG",0) or 0) * (sb.get("ENDOTOXIN_FAIL_FLAG",0) or 0)),
+        "process_deviation_count":   int(sb.get("PROCESS_DEVIATION_COUNT", 0) or 0),
+        "equipment_deviation_count": int(sb.get("EQUIPMENT_DEVIATION_COUNT", 0) or 0),
+        "human_deviation_count":     int(sb.get("HUMAN_DEVIATION_COUNT", 0) or 0),
+        "avg_temp_deviation_c":      float(sb.get("AVG_TEMP_DEVIATION_C", 0) or 0),
+        "batch_start_hour":          safe_int(sb.get("BATCH_START_HOUR"), 8),
+        "batch_start_dow":           safe_int(sb.get("BATCH_START_DOW"), 1),
+        "is_weekend_batch":          safe_int(sb.get("IS_WEEKEND_BATCH"), 0),
+        "is_night_shift":            safe_int(sb.get("IS_NIGHT_SHIFT"), 0),
+        "has_auto_block":            int(sb.get("HAS_AUTO_BLOCK_RULE", 0) or 0),
+        "fda_critical_violations":   int(sb.get("FDA_CRITICAL_VIOLATIONS", 0) or 0),
+        "max_hold_days":             int(sb.get("REGULATORY_HOLD_DAYS", 0) if hasattr(sb, "get") else 0),
+        "total_committed_revenue":   float(sb.get("TOTAL_COMMITTED_REVENUE", 0) or 0),
+        "total_material_cost":       float(sb.get("TOTAL_MATERIAL_COST", 0) or 0),
+        "total_penalty_exposure":    float(sb.get("TOTAL_PENALTY_EXPOSURE", 0) or 0),
+        "total_estimated_penalty":   float(sb.get("TOTAL_ESTIMATED_PENALTY_USD", sb.get("TOTAL_ESTIMATED_PENALTY_USD", 0)) or 0),
+        "orig_final_revenue":        float(sb.get("ORIG_FINAL_REVENUE", 0) or 0),
+        "orig_final_profit":         float(sb.get("ORIG_FINAL_PROFIT", 0) or 0),
+        "orig_penalty_applied":      float(sb.get("ORIG_PENALTY_APPLIED", 0) or 0),
+    }
+    orig["fp_pct"] = pct_int(orig["fail_prob"])
+    orig["rs_pct"] = pct_int(orig["rel_score"])
+    orig["risk"]   = "HIGH" if orig["fp_pct"] >= 65 else "MEDIUM" if orig["fp_pct"] >= 35 else "LOW"
+
+    # ── FLOW BANNER ───────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="flow-banner">'
+        '<b>Simulation flow:</b> Adjust quality parameters → <b>Simulate Predictions</b> → '
+        'XGBoost UDF returns failure probability → Gold decision logic applied (with FDA rule overrides) → '
+        'Financial impact recalculated. Financial columns are <i>never directly edited</i>.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── BATCH SUMMARY BAR ─────────────────────────────────────────────────
+    override_chip = ""
+    if orig["override_reason"] and orig["override_reason"] != "—":
+        override_chip = f'<span class="override-chip">Override: {orig["override_reason"]}</span>'
+
+    dbg, dtx, dbd = decision_colors(orig["decision"])
+    rfp_c         = fp_color(orig["fp_pct"])
+    risk_cls      = f'risk-{"high" if orig["risk"]=="HIGH" else "medium" if orig["risk"]=="MEDIUM" else "low"}'
+    dec_cls_map   = {"RELEASE":"badge-release","REJECT":"badge-reject","HOLD":"badge-hold","RETEST":"badge-retest"}
+    dec_cls       = dec_cls_map.get(orig["decision"], "badge-pending")
+
+    st.markdown(
+        f'<div class="batch-bar">'
+        f'  <div class="batch-bar-seg">'
+        f'    <div class="batch-bar-lbl">Batch ID</div>'
+        f'    <div class="batch-bar-val">{selected_bid}{override_chip}</div>'
+        f'  </div>'
+        f'  <div class="batch-bar-seg">'
+        f'    <div class="batch-bar-lbl">Failure Probability</div>'
+        f'    <div class="batch-bar-val-lg" style="color:{rfp_c};">{orig["fp_pct"]}%</div>'
+        f'  </div>'
+        f'  <div class="batch-bar-seg">'
+        f'    <div class="batch-bar-lbl">Risk Level</div>'
+        f'    <span class="risk-badge {risk_cls}">{orig["risk"]}</span>'
+        f'  </div>'
+        f'  <div class="batch-bar-seg">'
+        f'    <div class="batch-bar-lbl">Gold Decision</div>'
+        f'    <span class="badge {dec_cls}">{orig["decision"]}</span>'
+        f'  </div>'
+        f'  <div class="batch-bar-seg">'
+        f'    <div class="batch-bar-lbl">ML Model</div>'
+        f'    <div class="batch-bar-val" style="color:#7c3aed;">XGBoost UDF</div>'
+        f'  </div>'
+        f'  <div class="batch-bar-seg">'
+        f'    <div class="batch-bar-lbl">Product · Plant</div>'
+        f'    <div class="batch-bar-val" style="font-size:11px;">{orig["product_type"]} · {orig["plant_id"]}</div>'
+        f'  </div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Sterility warning
+    if orig["sterility_fail_flag"] == 1:
+        st.markdown(
+            '<div class="sterility-warn">⚠️ Sterility failure detected — '
+            'rule engine forces REJECT regardless of other parameters. '
+            'Simulation will still run ML but decision override applies.</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ═════════════════════════════════════════════════════════════════════
+    # MAIN TWO-COLUMN LAYOUT
+    # ═════════════════════════════════════════════════════════════════════
+    left_col, right_col = st.columns([1, 1.4], gap="medium")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # LEFT: INPUT PANEL
+    # ─────────────────────────────────────────────────────────────────────
+    with left_col:
+        st.markdown(
+            '<div class="panel-card">'
+            '  <div class="panel-card-hd">⚙️ Feature Parameters</div>'
+            '  <div class="panel-card-sub">Modify the 10 mutable quality features below</div>',
+            unsafe_allow_html=True,
+        )
+
+        _rc = st.session_state.reset_counter
+
+        # ENVIRONMENTAL
+        st.markdown('<span class="input-group-hd grp-env">🌡️ Environmental</span>', unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            sim_temp_viol = st.number_input("Temperature Violations", min_value=0, max_value=200, value=orig["temp_viol"], step=1, key=f"n_tv_{_rc}")
+        with c2:
+            sim_hum_viol = st.number_input("Humidity Violations", min_value=0, max_value=200, value=orig["hum_viol"], step=1, key=f"n_hv_{_rc}")
+        c3, _ = st.columns(2)
+        with c3:
+            sim_pres_viol = st.number_input("Pressure Violations", min_value=0, max_value=100, value=orig["pres_viol"], step=1, key=f"n_pv_{_rc}")
+
+        # QUALITY
+        st.markdown('<span class="input-group-hd grp-qual">🧫 Quality & Lab</span>', unsafe_allow_html=True)
+        q1, q2 = st.columns(2)
+        with q1:
+            sim_failed_test = st.number_input("Failed Test Count", min_value=0, max_value=100, value=orig["failed_tests"], step=1, key=f"n_ft_{_rc}")
+        with q2:
+            sim_oos = st.number_input("OOS Count", min_value=0, max_value=50, value=orig["oos"], step=1, key=f"n_oos_{_rc}")
+        q3, q4 = st.columns(2)
+        with q3:
+            sim_borderline = st.number_input("Borderline Count", min_value=0, max_value=100, value=orig["borderline"], step=1, key=f"n_bl_{_rc}")
+        with q4:
+            sim_pass_rate = st.number_input("Pass Rate (%)", min_value=0, max_value=100, value=int(orig["pass_rate"]), step=1, key=f"n_pr_{_rc}")
+
+        # DEVIATIONS
+        st.markdown('<span class="input-group-hd grp-dev">⚠️ Deviations & Process</span>', unsafe_allow_html=True)
+        d1, d2 = st.columns(2)
+        with d1:
+            sim_crit_dev = st.number_input("Critical Deviations", min_value=0, max_value=50, value=orig["crit_dev"], step=1, key=f"n_cd_{_rc}")
+        with d2:
+            sim_high_dev = st.number_input("High Deviations", min_value=0, max_value=100, value=orig["high_dev"], step=1, key=f"n_hd_{_rc}")
+        d3, _ = st.columns(2)
+        with d3:
+            sim_proc_var = st.number_input("Process Variance", min_value=0.0, max_value=1.0, value=min(float(orig["proc_var"]), 1.0), step=0.01, key=f"n_pvar_{_rc}")
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        
+
+    # ─────────────────────────────────────────────────────────────────────
+    # RIGHT: RESULTS PANEL
+    # ─────────────────────────────────────────────────────────────────────
+    with right_col:
+        sim_state  = st.session_state.get("simulated_data")
+        ml_has_run = sim_state is not None
+
+        if ml_has_run:
+            sim_fp_pct   = sim_state["fp_pct"]
+            sim_rs_pct   = sim_state["rs_pct"]
+            sim_risk     = sim_state["risk"]
+            sim_decision = sim_state["decision"]
+            sim_fin      = sim_state["financials"]
+            sim_override = sim_state.get("override_reason")
+        else:
+            sim_fp_pct   = orig["fp_pct"]
+            sim_rs_pct   = orig["rs_pct"]
+            sim_risk     = orig["risk"]
+            sim_decision = orig["decision"]
+            sim_fin      = None
+            sim_override = orig["override_reason"]
+
+        delta_fp   = orig["fp_pct"] - sim_fp_pct
+        delta_sign = "▼" if delta_fp > 0 else "▲" if delta_fp < 0 else "–"
+        delta_cls  = "delta-good" if delta_fp > 0 else "delta-bad" if delta_fp < 0 else "delta-neutral"
+
+        sim_fp_clr   = fp_color(sim_fp_pct)
+        srisk_cls    = f'risk-{"high" if sim_risk=="HIGH" else "medium" if sim_risk=="MEDIUM" else "low"}'
+        sim_dec_cls  = dec_cls_map.get(sim_decision, "badge-pending")
+        orig_dec_cls = dec_cls_map.get(orig["decision"], "badge-pending")
+
+        # ML Prediction chip (only when run)
+        if ml_has_run and st.session_state.get("ml_pred") is not None:
+            ml_pct = sim_state["fp_pct"]
+            ml_clr = fp_color(ml_pct)
+            ml_label = (
+                "HIGH RISK — REJECT/HOLD recommended" if ml_pct >= 65 else
+                "MEDIUM RISK — Review required"        if ml_pct >= 35 else
+                "LOW RISK — Release likely"
+            )
+            override_rsn = sim_state.get("override_reason")
+            override_note = f'<div style="font-size:9px;color:rgba(255,255,255,0.4);margin-top:3px;">Rule override: {override_rsn}</div>' if override_rsn else ""
+            st.markdown(
+                f'<div class="ml-chip">'
+                f'  <div class="ml-chip-left">'
+                f'    <div class="ml-chip-icon">🧠</div>'
+                f'    <div>'
+                f'      <div class="ml-chip-label">XGBoost UDF Output</div>'
+                f'      <div class="ml-chip-val" style="color:{ml_clr};">{ml_pct}%</div>'
+                f'      <div class="ml-chip-sub">{ml_label}</div>'
+                f'      {override_note}'
+                f'    </div>'
+                f'  </div>'
+                f'  <div class="ml-chip-tag">Failure Prob</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── UNIFIED COMPARISON TABLE ──────────────────────────────────────
+        pending_note = "" if ml_has_run else '<div style="font-size:9px;color:#d97706;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:4px 10px;text-align:center;margin-bottom:8px;">⏳ Run Simulate Predictions to update simulated values</div>'
+
+        sim_rev_str    = fmt_currency(sim_fin["final_revenue"])  if sim_fin else "—"
+        sim_profit_str = fmt_currency(sim_fin["final_profit"])   if sim_fin else "—"
+        sim_profit_clr = "#16a34a" if (sim_fin and sim_fin["final_profit"] >= 0) else "#dc2626"
+        orig_profit_clr = "#16a34a" if orig["orig_final_profit"] >= 0 else "#dc2626"
+
+        muted = "cmp-val-muted" if not ml_has_run else ""
+
+        st.markdown(
+            f'<div class="cmp-panel">'
+            f'  <div class="cmp-panel-hd">'
+            f'    <div>'
+            f'      <span class="cmp-panel-hd-title">📊 Simulation Comparison</span>'
+            f'      <span class="cmp-panel-hd-sub"> · Gold layer vs XGBoost simulation</span>'
+            f'    </div>'
+            f'    <span class="delta-pill {delta_cls}">{delta_sign} {abs(delta_fp)}pp</span>'
+            f'  </div>'
+            f'  {pending_note}'
+            f'  <table class="cmp-table">'
+            f'    <thead><tr>'
+            f'      <th>Metric</th>'
+            f'      <th class="cmp-col-hd-current">Current (Gold)</th>'
+            f'      <th class="cmp-col-hd-sim">Simulated</th>'
+            f'    </tr></thead>'
+            f'    <tbody>'
+            f'    <tr>'
+            f'      <td class="cmp-row-lbl">Failure Probability</td>'
+            f'      <td class="cmp-val" style="color:{fp_color(orig["fp_pct"])};">{orig["fp_pct"]}%</td>'
+            f'      <td class="cmp-val {muted}" style="color:{sim_fp_clr if ml_has_run else "var(--gray-400)"};">{sim_fp_pct}%</td>'
+            f'    </tr>'
+            f'    <tr>'
+            f'      <td class="cmp-row-lbl">Release Score</td>'
+            f'      <td class="cmp-val">{orig["rs_pct"]}%</td>'
+            f'      <td class="cmp-val {muted}">{sim_rs_pct}%</td>'
+            f'    </tr>'
+            f'    <tr>'
+            f'      <td class="cmp-row-lbl">Risk Level</td>'
+            f'      <td><span class="risk-badge risk-{"high" if orig["risk"]=="HIGH" else "medium" if orig["risk"]=="MEDIUM" else "low"}">{orig["risk"]}</span></td>'
+            f'      <td><span class="risk-badge {srisk_cls}">{sim_risk}</span></td>'
+            f'    </tr>'
+            f'    <tr>'
+            f'      <td class="cmp-row-lbl">Final Decision</td>'
+            f'      <td><span class="badge {orig_dec_cls}">{orig["decision"]}</span></td>'
+            f'      <td><span class="badge {sim_dec_cls}">{sim_decision}</span></td>'
+            f'    </tr>'
+            f'    <tr>'
+            f'      <td class="cmp-row-lbl">Final Revenue</td>'
+            f'      <td class="cmp-val">{fmt_currency(orig["orig_final_revenue"])}</td>'
+            f'      <td class="cmp-val {muted}">{sim_rev_str}</td>'
+            f'    </tr>'
+            f'    <tr>'
+            f'      <td class="cmp-row-lbl">Final Profit</td>'
+            f'      <td class="cmp-val" style="color:{orig_profit_clr};">{fmt_currency(orig["orig_final_profit"])}</td>'
+            f'      <td class="cmp-val {muted}" style="color:{sim_profit_clr if ml_has_run else "var(--gray-400)"};">{sim_profit_str}</td>'
+            f'    </tr>'
+            f'    </tbody>'
+            f'  </table>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Financial delta strip
+        if ml_has_run and sim_fin:
+            rev_delta    = sim_fin["final_revenue"]   - orig["orig_final_revenue"]
+            profit_delta = sim_fin["final_profit"]    - orig["orig_final_profit"]
+            pen_delta    = sim_fin["penalty_applied"] - orig["orig_penalty_applied"]
+            rev_clr      = "#16a34a" if rev_delta >= 0 else "#dc2626"
+            prf_clr      = "#16a34a" if profit_delta >= 0 else "#dc2626"
+            pen_clr      = "#dc2626" if pen_delta > 0 else "#16a34a"
+            st.markdown(
+                f'<div class="fin-strip">'
+                f'  <div class="fin-strip-box" style="background:#f0fdf4;border-color:#bbf7d0;">'
+                f'    <div class="fin-strip-lbl">Revenue Δ</div>'
+                f'    <div class="fin-strip-val" style="color:{rev_clr};">{"+" if rev_delta>=0 else ""}{fmt_currency(rev_delta)}</div>'
+                f'  </div>'
+                f'  <div class="fin-strip-box" style="background:#eff6ff;border-color:#bfdbfe;">'
+                f'    <div class="fin-strip-lbl">Profit Δ</div>'
+                f'    <div class="fin-strip-val" style="color:{prf_clr};">{"+" if profit_delta>=0 else ""}{fmt_currency(profit_delta)}</div>'
+                f'  </div>'
+                f'  <div class="fin-strip-box" style="background:#fff7ed;border-color:#fed7aa;">'
+                f'    <div class="fin-strip-lbl">Penalty Δ</div>'
+                f'    <div class="fin-strip-val" style="color:{pen_clr};">{"+" if pen_delta>=0 else ""}{fmt_currency(pen_delta)}</div>'
+                f'  </div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Outcome banner
+        if ml_has_run:
+            if sim_decision in ("RELEASE","RETEST") and orig["decision"] in ("HOLD","REJECT"):
+                bcls, bicon = "outcome-good", "✅"
+                btitle = f"Improvement: {orig['decision']} → {sim_decision}"
+                bsub   = f"Failure probability reduced by {abs(delta_fp)}pp."
+            elif sim_decision == orig["decision"]:
+                bcls, bicon = "outcome-warn", "⚠️"
+                btitle = f"Decision unchanged: {sim_decision}"
+                bsub   = "Adjust parameters further to change the outcome."
+            elif sim_decision in ("HOLD","REJECT") and orig["decision"] in ("RELEASE","RETEST"):
+                bcls, bicon = "outcome-bad", "❌"
+                btitle = f"Warning: {orig['decision']} → {sim_decision}"
+                bsub   = f"Failure probability increased by {abs(delta_fp)}pp."
+            else:
+                bcls, bicon = "outcome-change", "🔄"
+                btitle = f"Decision changed: {orig['decision']} → {sim_decision}"
+                bsub   = f"Failure probability delta: {delta_fp:+d}pp"
+            st.markdown(
+                f'<div class="outcome-bar {bcls}">'
+                f'  <span class="outcome-icon">{bicon}</span>'
+                f'  <div><div>{btitle}</div><div class="outcome-sub">{bsub}</div></div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+       
+        # ── PREMIUM RISK CONTRIBUTION CARD ─────────────────────
+
+        # ── RISK CONTRIBUTION CARD ─────────────────────────────────────────
+        denom = max(sim_temp_viol + sim_failed_test + sim_crit_dev + sim_hum_viol, 1)
+        risk_segments = [
+            (max(sim_temp_viol,   1), "#ef4444", "Temperature",  f"{round(sim_temp_viol/denom*100)}%"),
+            (max(sim_failed_test, 1), "#f97316", "Tests",        f"{round(sim_failed_test/denom*100)}%"),
+            (max(sim_crit_dev,    1), "#eab308", "Critical",     f"{round(sim_crit_dev/denom*100)}%"),
+            (max(sim_hum_viol,    1), "#22c55e", "Humidity",     f"{round(sim_hum_viol/denom*100)}%"),
+        ]
+        svg_chart_2, donut_legend = svg_donut_risk(risk_segments, f"{sim_fp_pct}%")
+
+        risk_card_html = (
+            '<div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:18px;'
+            'padding:14px 18px;margin-top:12px;box-shadow:0 1px 8px rgba(15,23,42,0.05);">'
+            '<div style="display:flex;justify-content:space-between;align-items:center;'
+            'margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid #f1f5f9;">'
+            '<span style="font-size:10px;font-weight:800;color:#475569;'
+            'text-transform:uppercase;letter-spacing:0.6px;">Risk Contribution</span>'
+            '<span style="font-size:9px;color:#94a3b8;font-weight:600;">Live Simulation</span>'
+            '</div>'
+            '<div style="display:flex;align-items:center;gap:12px;padding:0;">'
+            '<div style="flex-shrink:0;">'
+            + svg_chart_2 +
+            '</div>'
+            '<div style="flex:1;font-size:11px;line-height:1.8;">'
+            + donut_legend +
+            '</div>'
+            '</div>'
+            '</div>'
+        )
+        st.markdown(risk_card_html, unsafe_allow_html=True)
+        # ── BUTTONS + TIP BAR (below risk chart, still right col) ─────────
+        st.markdown('<div style="height:10px;"></div>', unsafe_allow_html=True)
+        btn_l, btn_r = st.columns([1, 1.6])
+        with btn_l:
+            if st.button("↺ Reset", use_container_width=True, key="reset_sim"):
+                st.session_state.reset_counter += 1
+                st.session_state.ml_pred = None
+                st.session_state.simulated_data = None
+                st.rerun()
+        with btn_r:
+            run_clicked = st.button("▶ Simulate Predictions", use_container_width=True, type="primary", key="run_ml_sim")
+
+        st.markdown(
+            '<div class="tip-bar">💡 Adjust parameters → <b>Simulate Predictions</b> → see recalculated failure probability, decision and financial impact.</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── ML PREDICTION TRIGGER (same logic, moved here after columns) ──────
+    # NOTE: The run button is rendered inside left_col above (run_clicked var),
+    # but the spinner/logic block runs outside columns so it spans full width.
+    if run_clicked:
+        with st.spinner("Running XGBoost UDF → applying Gold decision logic → recalculating financials…"):
+            sim_inputs = {
+                "temp_viol":    sim_temp_viol,
+                "hum_viol":     sim_hum_viol,
+                "pres_viol":    sim_pres_viol,
+                "failed_tests": sim_failed_test,
+                "oos":          sim_oos,
+                "borderline":   sim_borderline,
+                "pass_rate":    float(sim_pass_rate),
+                "crit_dev":     sim_crit_dev,
+                "high_dev":     sim_high_dev,
+                "proc_var":     sim_proc_var,
+            }
+            udf_params = build_udf_params_from_simulation(orig, sim_inputs)
+            ml_fp_raw  = call_ml_udf(udf_params)
+
+            if ml_fp_raw is not None:
+                ml_fp_prob = ml_fp_raw if ml_fp_raw <= 1.0 else ml_fp_raw / 100.0
+                ml_fp_pct  = int(ml_fp_prob * 100)
+                ml_rs_pct  = max(0, 100 - ml_fp_pct)
+                ml_risk, _ = risk_label_and_cls(ml_fp_pct)
+
+                final_decision, override_rsn = derive_decision_from_prob(
+                    failure_prob            = ml_fp_prob,
+                    sterility_flag          = orig["sterility_fail_flag"],
+                    endotoxin_flag          = orig["endotoxin_fail_flag"],
+                    has_auto_block          = orig["has_auto_block"],
+                    fda_critical_violations = orig["fda_critical_violations"],
+                    max_hold_days           = orig["max_hold_days"],
+                )
+                fin = recalculate_financials(
+                    decision                    = final_decision,
+                    total_committed_revenue     = orig["total_committed_revenue"],
+                    total_material_cost         = orig["total_material_cost"],
+                    total_penalty_exposure      = orig["total_penalty_exposure"],
+                    total_estimated_penalty_usd = orig["total_estimated_penalty"],
+                )
+                st.session_state.simulated_data = {
+                    "fp_pct":          ml_fp_pct,
+                    "rs_pct":          ml_rs_pct,
+                    "risk":            ml_risk,
+                    "decision":        final_decision,
+                    "override_reason": override_rsn,
+                    "financials":      fin,
+                }
+                st.session_state.ml_pred       = ml_fp_raw
+                st.session_state.last_ml_batch = selected_bid
+                st.rerun()
+            else:
+                st.warning("ML UDF returned no prediction. Check UDF availability and parameters.")
+
+   # ═════════════════════════════════════════════════════════════════════
+    # BOTTOM: CHARTS + AI RECOMMENDATIONS
+    # ═════════════════════════════════════════════════════════════════════
+    
+   
+    
+    
+    
+    # ─────────────────────────────────────────────────────────────
+    # CHARTS LAYOUT
+    # ─────────────────────────────────────────────────────────────
+    
+    
+    
+    
+    # ─────────────────────────────────────────────────────────────
+    # RISK CONTRIBUTION BREAKDOWN
+    # ─────────────────────────────────────────────────────────────
+  
+    
+    # ── AI RECOMMENDATIONS ─────────────────────────────────────────────────
+    recs = []
+    
+    if sim_temp_viol > 3:
+        recs.append(("🌡️", "Maintain temperature within ±2°C to keep violations below 3 (21 CFR 211.68)."))
+    else:
+        recs.append(("✅", "Temperature is within acceptable range — maintain current controls."))
+    
+    if sim_proc_var > 0.20:
+        recs.append(("📉", "Process variance exceeds 0.20 — target below 0.15 through parameter optimization."))
+    else:
+        recs.append(("✅", "Process variance is well-controlled — document current parameters for audit trail."))
+    
+    if float(sim_pass_rate) < 95:
+        recs.append(("🔬", "Pass rate below 95% — enhance QC checks before next batch release (21 CFR 211.165)."))
+    
+    if sim_crit_dev > 1:
+        recs.append(("⚠️", "Investigate root cause of critical deviations under ICH Q9 before release."))
+    
+    if ml_has_run and sim_decision in ("RELEASE","RETEST") and orig["decision"] in ("HOLD","REJECT"):
+        recs.append(("📋", f"Parameters now support {sim_decision} — review with QA team before final sign-off."))
+    
+    rec_items = "".join([
+        f'<div class="ai-rec"><span class="ai-rec-icon">{icon}</span><span>{text}</span></div>'
+        for icon, text in recs
+    ])
+    
+    st.markdown(
+        '<div class="ai-panel">'
+        '<div class="ai-panel-hd">🤖 AI Recommendations</div>'
+        '<div class="ai-panel-sub">Based on simulated parameters and Gold layer decision logic</div>'
+        + rec_items +
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    
+    # ── FOOTER ─────────────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="page-footer">Batch Simulation Lab · XGBoost UDF → Gold Decision Logic → Financial Recalc · In-Memory Only · Snowflake Native</div>',
+        unsafe_allow_html=True,
+    )
+    
+    # ── CHATBOT ────────────────────────────────────────────────────────────
+    render_chatbot(batch_context=selected_bid if selected_bid else None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTING — UNCHANGED
+# ─────────────────────────────────────────────────────────────────────────────
+if st.session_state.page == "landing":
+    show_landing_page()
+elif st.session_state.page == "dashboard":
+    show_dashboard()
+elif st.session_state.page == "simulation":
+    show_simulation_page()

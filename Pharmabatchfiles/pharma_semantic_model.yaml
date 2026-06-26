@@ -1,0 +1,163 @@
+# PharmaCopilot Semantic Model for Cortex Analyst
+# Defines the natural-language query interface for the Gold layer
+name: PharmaCopilot
+description: >
+  Pharmaceutical manufacturing intelligence semantic model.
+  Supports natural language queries over batch quality, FDA compliance,
+  ML predictions, and financial impact analysis.
+
+tables:
+  - name: BATCH_FACT
+    base_table:
+      schema: GOLD_V2
+      table: BATCH_FACT
+    description: >
+      Core gold fact table. One row per batch. Combines ML scores,
+      FDA rule overrides, financial metrics, and quality features.
+    dimensions:
+      - name: BATCH_ID
+        expr: BATCH_ID
+        description: Unique batch identifier
+        data_type: VARCHAR
+      - name: PRODUCT_NAME
+        expr: PRODUCT_NAME
+        description: Product name
+        data_type: VARCHAR
+      - name: PRODUCT_TYPE
+        expr: PRODUCT_TYPE
+        description: Product type category
+        data_type: VARCHAR
+      - name: DOSAGE_FORM
+        expr: DOSAGE_FORM
+        description: Dosage form (Tablet, Injectable, Vaccine, Topical, Biologic, Other)
+        data_type: VARCHAR
+      - name: PLANT_ID
+        expr: PLANT_ID
+        description: Manufacturing plant identifier
+        data_type: VARCHAR
+      - name: FINAL_DECISION
+        expr: FINAL_DECISION
+        description: Final batch disposition (RELEASE, RETEST, HOLD, REJECT)
+        data_type: VARCHAR
+      - name: ML_PREDICTED_ACTION
+        expr: ML_PREDICTED_ACTION
+        description: ML model predicted action before rule overrides
+        data_type: VARCHAR
+      - name: RULE_OVERRIDE_REASON
+        expr: RULE_OVERRIDE_REASON
+        description: Reason for rule engine override of ML decision (null if no override)
+        data_type: VARCHAR
+      - name: BATCH_DATE
+        expr: BATCH_DATE
+        description: Planned release date of the batch
+        data_type: DATE
+    measures:
+      - name: FAILURE_PROBABILITY
+        expr: FAILURE_PROBABILITY
+        description: ML-predicted failure probability (0.0 to 1.0)
+        data_type: FLOAT
+        default_aggregation: avg
+      - name: RELEASE_SCORE
+        expr: RELEASE_SCORE
+        description: ML release confidence score (1 - failure_probability)
+        data_type: FLOAT
+        default_aggregation: avg
+      - name: TOTAL_COMMITTED_REVENUE
+        expr: TOTAL_COMMITTED_REVENUE
+        description: Total committed revenue from customer agreements (USD)
+        data_type: FLOAT
+        default_aggregation: sum
+      - name: TOTAL_MATERIAL_COST
+        expr: TOTAL_MATERIAL_COST
+        description: Total material acquisition cost (USD)
+        data_type: FLOAT
+        default_aggregation: sum
+      - name: GROSS_MARGIN
+        expr: GROSS_MARGIN
+        description: Revenue minus material cost (USD)
+        data_type: FLOAT
+        default_aggregation: sum
+      - name: FINAL_REVENUE
+        expr: FINAL_REVENUE
+        description: Net realised revenue after decision-based adjustments (USD)
+        data_type: FLOAT
+        default_aggregation: sum
+      - name: FINAL_PROFIT
+        expr: FINAL_PROFIT
+        description: Net profit after all costs and penalties (USD)
+        data_type: FLOAT
+        default_aggregation: sum
+      - name: PENALTY_APPLIED
+        expr: PENALTY_APPLIED
+        description: Penalty amount applied based on final decision (USD)
+        data_type: FLOAT
+        default_aggregation: sum
+      - name: TOTAL_PENALTY_EXPOSURE
+        expr: TOTAL_PENALTY_EXPOSURE
+        description: Maximum potential penalty exposure (USD)
+        data_type: FLOAT
+        default_aggregation: sum
+      - name: FDA_VIOLATION_COUNT
+        expr: FDA_VIOLATION_COUNT
+        description: Number of FDA rule violations triggered
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: TOTAL_TESTS
+        expr: TOTAL_TESTS
+        description: Total lab tests performed on the batch
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: FAILED_TEST_COUNT
+        expr: FAILED_TEST_COUNT
+        description: Number of failed lab tests
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: TOTAL_DEVIATIONS
+        expr: TOTAL_DEVIATIONS
+        description: Total process deviations recorded
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: OVERALL_RISK_SCORE
+        expr: OVERALL_RISK_SCORE
+        description: Blended risk score combining ML and financial risk (0.0 to 1.0)
+        data_type: FLOAT
+        default_aggregation: avg
+
+  - name: BATCH_SIMULATION_LOG
+    base_table:
+      schema: GOLD_V2
+      table: BATCH_SIMULATION_LOG
+    description: >
+      Audit trail for what-if simulations run from the Streamlit Simulation Lab.
+    dimensions:
+      - name: SIM_ID
+        expr: SIM_ID
+        description: Unique simulation run identifier
+        data_type: VARCHAR
+      - name: BATCH_ID
+        expr: BATCH_ID
+        description: Batch that was simulated
+        data_type: VARCHAR
+      - name: SIMULATED_BY
+        expr: SIMULATED_BY
+        description: User who ran the simulation
+        data_type: VARCHAR
+      - name: SIM_ML_DECISION
+        expr: SIM_ML_DECISION
+        description: Simulated ML decision outcome
+        data_type: VARCHAR
+      - name: DECISION_CHANGED
+        expr: DECISION_CHANGED
+        description: Whether the simulation changed the original decision
+        data_type: BOOLEAN
+    measures:
+      - name: SIM_FAILURE_PROB
+        expr: SIM_FAILURE_PROB
+        description: Simulated failure probability
+        data_type: FLOAT
+        default_aggregation: avg
+      - name: DELTA_FAILURE_PROB_PP
+        expr: DELTA_FAILURE_PROB_PP
+        description: Change in failure probability from original (percentage points)
+        data_type: FLOAT
+        default_aggregation: avg
